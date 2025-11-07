@@ -49,7 +49,7 @@ static void make_names(const char *prefix, const char *user, const char *group,
 }
 
 static void menu(void){
-    puts("Choix des commandes :");
+    puts("Choix des commandes :            ");
     puts("0 Creation de groupe");
     puts("1 Rejoindre un groupe");
     puts("2 Lister les groupes");
@@ -97,7 +97,7 @@ static void *rx_thread(void *arg){
     return NULL;
 }
 
-/* ───────── Affichage ───────── */
+/* ───────── Affichage (process séparé) ───────── */
 static pid_t spawn_affichage(const char *spec, const char *sem_name){
     pid_t pid = fork();
     if(pid < 0) die_perror("fork AffichageISY");
@@ -108,48 +108,70 @@ static pid_t spawn_affichage(const char *spec, const char *sem_name){
     return pid;
 }
 
-/* ───────── Boucle de dialogue avec affichage dédié ───────── */
+/* ───────── UI helpers (éviter l’écho dans le terminal client) ───────── */
+static inline void ui_prompt(void){
+    /* Efface la ligne courante et réaffiche un prompt court, SANS retour à la ligne */
+    printf("\033[2K\rMessage : ");
+    fflush(stdout);
+}
+static inline void ui_clear_prevline(void){
+    /* Remonte d'une ligne (celle où l'utilisateur vient de taper), efface, revient début */
+    printf("\033[1A\033[2K\r");
+    fflush(stdout);
+}
+
+/* ───────── Boucle de dialogue : Affichage dédié + effacement écho ───────── */
 static void dialog_loop(const char *user, int rx, struct sockaddr_in *grp,
                         ISYRing *rb, sem_t *sem,
                         const char *display_spec, const char *sem_name){
     char line[256];
 
-    // (Ré)ouvre l’affichage uniquement pour la durée du dialogue
+    /* (Ré)ouvre l’affichage uniquement pour la durée du dialogue */
     rb->closed = 0;
     pid_t viewer = spawn_affichage(display_spec, sem_name);
 
     puts("Tapez quit pour revenir au menu , cmd pour entrer une commande , msg pour revenir aux messages");
+    ui_prompt();
+
     for(;;){
-        printf("Message : "); fflush(stdout);
         if(!fgets(line, sizeof line, stdin)) break;
         trimnl(line);
+
+        /* On efface la ligne que l'utilisateur vient d'envoyer */
+        ui_clear_prevline();
+
         if(!strcmp(line, "quit")) break;
 
         if(!strcmp(line, "cmd")){
-            printf("Commande : "); fflush(stdout);
-            if(!fgets(line, sizeof line, stdin)) break; trimnl(line);
+            /* prompt commande sur la même ligne */
+            printf("Commande : ");
+            fflush(stdout);
+            if(!fgets(line, sizeof line, stdin)) break;
+            trimnl(line);
+            /* efface la ligne de commande saisie */
+            ui_clear_prevline();
+
             if(!strncmp(line, "list", 4)){
                 const char *cmdg = "CMD LIST";
                 if(sendto(rx, cmdg, strlen(cmdg), 0, (struct sockaddr*)grp, sizeof *grp) < 0) die_perror("sendto CMD LIST");
             } else if(!strncmp(line, "Delete ", 7) || !strncmp(line, "DELETE ", 7)){
                 char cmdg[128]; snprintf(cmdg, sizeof cmdg, "CMD DELETE %s", line+7);
                 if(sendto(rx, cmdg, strlen(cmdg), 0, (struct sockaddr*)grp, sizeof *grp) < 0) die_perror("sendto CMD DELETE");
-            } else if(!strncmp(line, "msg", 3)){
-                continue;
-            } else {
-                puts("Commande inconnue");
-            }
-        } else {
+            } /* sinon: commande inconnue -> rien à afficher côté client */
+        } else if(line[0] != '\0'){
             char out[256];
             snprintf(out, sizeof out, "MSG %s %s", user, line);
             if(sendto(rx, out, strlen(out), 0, (struct sockaddr*)grp, sizeof *grp) < 0) die_perror("sendto MSG");
         }
+
+        /* Ré-affiche un prompt propre sur la même ligne (pas d’écho du texte tapé) */
+        ui_prompt();
     }
 
-    // Arrêt propre de l’affichage local
+    /* Arrêt propre de l’affichage local */
     rb->closed = 1;
-    sem_post(sem);                 // réveille l’affichage s’il dort
-    waitpid(viewer, NULL, 0);      // attend sa fin
+    sem_post(sem);
+    waitpid(viewer, NULL, 0);
 }
 
 /* ───────── Main ───────── */
@@ -179,7 +201,7 @@ int main(int argc, char **argv){
     char sem_name_saved[128]="";
     char display_spec_saved[PATH_MAX + 6]="";
 
-    // Ressources session (persistantes tant qu’on ne “quitte pas le groupe”)
+    // Ressources session
     ISYRing *rb  = NULL;
     sem_t  *sem  = NULL;
     pthread_t rx_th;
@@ -236,20 +258,16 @@ int main(int argc, char **argv){
             grp.sin_family = AF_INET; grp.sin_port = htons((uint16_t)gport);
             if(inet_pton(AF_INET, "127.0.0.1", &grp.sin_addr) != 1) die_perror("inet_pton grp");
 
-            printf("Connexion au groupe %s realisee\n", current_group);
-
-            /* ── SHM/SEM avec fallback fichier ─────────────────────────── */
+            /* SHM/SEM avec fallback fichier */
             char shm_name[128], sem_name[128];
             make_names(conf.shm_prefix, conf.user, current_group, shm_name, sizeof shm_name, sem_name, sizeof sem_name);
             strncpy(sem_name_saved, sem_name, sizeof sem_name_saved -1);
 
-            // purge
             shm_unlink(shm_name); sem_unlink(sem_name);
 
             int shm_fd = -1, use_file = 0;
             char file_spec[PATH_MAX]; file_spec[0]='\0';
 
-            // tente SHM
             shm_fd = shm_open(shm_name, O_CREAT|O_EXCL|O_RDWR, 0600);
             if (shm_fd < 0 && errno == EEXIST) shm_fd = shm_open(shm_name, O_RDWR, 0600);
 
@@ -293,12 +311,12 @@ int main(int argc, char **argv){
             if(sem == SEM_FAILED && errno == EEXIST) sem = sem_open(sem_name, 0);
             if(sem == SEM_FAILED) die_perror("sem_open");
 
-            // Thread RX (persistant tant qu’on ne quitte pas le groupe)
+            /* Thread RX (persistant tant qu’on ne quitte pas le groupe) */
             ctx = (RxCtx*)calloc(1, sizeof *ctx);
             ctx->rx_sock = rx; ctx->stop = 0; ctx->rb = rb; ctx->sem = sem;
             if(pthread_create(&rx_th, NULL, rx_thread, ctx) != 0) die_perror("pthread_create");
 
-            // auto-enregistrement
+            /* auto-enregistrement pour que le groupe nous “voit” sur rx */
             {
                 char hello[128];
                 snprintf(hello, sizeof hello, "MSG %s %s", conf.user, "(joined)");
@@ -306,7 +324,6 @@ int main(int argc, char **argv){
             }
 
             joined = 1;
-            // lance immédiatement un dialogue avec affichage temporaire
             dialog_loop(conf.user, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
             continue;
         }
@@ -319,7 +336,6 @@ int main(int argc, char **argv){
 
         if(!strcmp(line,"5")){
             if(!joined){ puts("Vous n'êtes dans aucun groupe."); continue; }
-            // arrêt du RX + libération SHM/SEM (ferme aussi un éventuel affichage qui traînerait)
             if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); ctx = NULL; }
             if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); rb = NULL; }
             if(sem){ sem_close(sem); sem = NULL; }
@@ -334,7 +350,6 @@ int main(int argc, char **argv){
         if(!strcmp(line,"4")) break;
     }
 
-    // cleanup global si session encore active
     if(joined){
         if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); }
         if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); }
