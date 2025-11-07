@@ -1,3 +1,4 @@
+// src/ServeurISY.c
 #include "Commun.h"
 
 #define MAX_GROUPS 64
@@ -10,17 +11,17 @@ typedef struct {
 } SrvGroup;
 
 static volatile sig_atomic_t running = 1;
-static void on_sigint(int){ running = 0; }
 
-/* ───────────────────────────
-   Lecture conf serveur
-   ─────────────────────────── */
+static void on_sigint(int signo){
+    (void)signo;
+    running = 0;
+}
+
 static int load_conf(const char *path, char *srv_ip, uint16_t *srv_port, uint16_t *base_port, int *max_groups){
     FILE *f = fopen(path, "r"); if(!f) return -1;
-    char line[256];
+    char line[256], k[64], v[128];
     while (fgets(line, sizeof line, f)) {
         if(line[0]=='#' || strlen(line)<3) continue;
-        char k[64], v[128];
         if (sscanf(line, "%63[^=]=%127s", k, v)==2) {
             if (!strcmp(k, "SERVER_IP")) strncpy(srv_ip, v, 63);
             else if (!strcmp(k, "SERVER_PORT")) *srv_port = (uint16_t)atoi(v);
@@ -31,45 +32,77 @@ static int load_conf(const char *path, char *srv_ip, uint16_t *srv_port, uint16_
     fclose(f); return 0;
 }
 
+static void set_rcv_timeout(int sock, int ms){
+    struct timeval tv;
+    tv.tv_sec  = ms/1000;
+    tv.tv_usec = (ms%1000)*1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 /* ───────────────────────────
-   Thread bannière live
-   Chaque ligne saisie sur stdin → "SYS <texte>"
-   envoyée à tous les groupes actifs
+   Thread console admin (stdin)
+   Commandes :
+     /ban <texte>   → CTRL BANNER_SET <texte>
+     /banoff        → CTRL BANNER_CLR
+     <texte libre>  → SYS <texte> (message non collant, optionnel)
    ─────────────────────────── */
 typedef struct {
     int sock;
     char srv_ip[64];
     SrvGroup *groups;
     int max_groups;
-} BannerCtx;
+    volatile sig_atomic_t *runflag;
+} AdminCtx;
 
-static void *banner_thread(void *arg){
-    BannerCtx *ctx = (BannerCtx*)arg;
+static void send_to_all_groups(int sock, const char *srv_ip, SrvGroup *groups, int max_groups, const char *payload){
+    for(int i=0;i<max_groups;i++){
+        if(!groups[i].active) continue;
+        struct sockaddr_in g = {0};
+        g.sin_family = AF_INET;
+        g.sin_port   = htons(groups[i].port);
+        if(inet_pton(AF_INET, srv_ip, &g.sin_addr) != 1) continue;
+        (void)sendto(sock, payload, strlen(payload), 0, (struct sockaddr*)&g, sizeof g);
+    }
+}
+
+static void *admin_thread(void *arg){
+    AdminCtx *ctx = (AdminCtx*)arg;
     char *line = NULL; size_t cap = 0;
 
-    fprintf(stdout, "[BANNER] Saisissez une ligne et Entrée pour l’envoyer à tous les groupes. Ctrl-D pour arrêter la bannière.\n");
+    fprintf(stdout,
+        "[ADMIN] Commandes:\n"
+        "  /ban <texte>   → bannière collante pour tous\n"
+        "  /banoff        → retirer la bannière\n"
+        "  <texte libre>  → message non collant (SYS)\n");
     fflush(stdout);
 
-    while (1){
+    while(*(ctx->runflag)){
+        errno = 0;
         ssize_t n = getline(&line, &cap, stdin);
-        if(n <= 0) break; // EOF ou erreur → on sort
+        if(n <= 0){
+            if(errno == EINTR) continue;     // interrompu par signal
+            break;                            // EOF ou erreur
+        }
         trimnl(line);
         if(line[0] == '\0') continue;
 
-        // Construire payload "SYS <texte>"
-        char payload[512];
-        snprintf(payload, sizeof payload, "SYS %s", line);
-
-        // Envoyer à chaque groupe actif
-        for(int i=0;i<ctx->max_groups;i++){
-            if(!ctx->groups[i].active) continue;
-            struct sockaddr_in g = {0};
-            g.sin_family = AF_INET;
-            g.sin_port   = htons(ctx->groups[i].port);
-            if(inet_pton(AF_INET, ctx->srv_ip, &g.sin_addr) != 1) continue;
-            (void)sendto(ctx->sock, payload, strlen(payload), 0, (struct sockaddr*)&g, sizeof g);
+        if(!strncmp(line, "/banoff", 7)){
+            char payload[] = "CTRL BANNER_CLR";
+            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
+            fprintf(stdout, "[ADMIN] Bannière retirée.\n"); fflush(stdout);
+        }else if(!strncmp(line, "/ban ", 5)){
+            char payload[512];
+            snprintf(payload, sizeof payload, "CTRL BANNER_SET %s", line+5);
+            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
+            fprintf(stdout, "[ADMIN] Bannière posée.\n"); fflush(stdout);
+        }else{
+            // message live non-collant conservé (optionnel)
+            char payload[512];
+            snprintf(payload, sizeof payload, "SYS %s", line);
+            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
         }
     }
+
     free(line);
     return NULL;
 }
@@ -80,6 +113,7 @@ static void *banner_thread(void *arg){
 int main(int argc, char **argv){
     if(argc<2){ fprintf(stderr, "Usage: %s conf/server.conf\n", argv[0]); return 1; }
 
+    // Config par défaut
     char srv_ip[64]="127.0.0.1";
     uint16_t srv_port=8000, base_port=8010;
     int max_groups=16;
@@ -87,9 +121,17 @@ int main(int argc, char **argv){
     if (load_conf(argv[1], srv_ip, &srv_port, &base_port, &max_groups)<0) die_perror("server conf");
     if(max_groups > MAX_GROUPS) max_groups = MAX_GROUPS;
 
-    signal(SIGINT, on_sigint);
+    // Signal SIGINT réactif
+    struct sigaction sa;
+    memset(&sa,0,sizeof sa);
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
+    // Socket UDP serveur
     int s = socket(AF_INET, SOCK_DGRAM, 0); if(s<0) die_perror("socket");
+    set_rcv_timeout(s, 500); // rend recvfrom interruptible par timeout pour honorer SIGINT
     struct sockaddr_in addr; memset(&addr,0,sizeof addr);
     addr.sin_family=AF_INET; addr.sin_port=htons(srv_port);
     if (inet_pton(AF_INET, srv_ip, &addr.sin_addr) != 1) die_perror("inet_pton");
@@ -100,21 +142,26 @@ int main(int argc, char **argv){
 
     fprintf(stdout, "ServeurISY: %s:%u prêt\n", srv_ip, (unsigned)srv_port);
 
-    /* Lancer le thread bannière */
-    BannerCtx bctx = {.sock = s, .groups = groups, .max_groups = max_groups};
-    strncpy(bctx.srv_ip, srv_ip, sizeof bctx.srv_ip - 1);
-    pthread_t bth;
-    if(pthread_create(&bth, NULL, banner_thread, &bctx) != 0){
-        perror("pthread_create(banner)"); // non fatal
+    // Thread admin console
+    AdminCtx actx = {.sock=s, .groups=groups, .max_groups=max_groups, .runflag=&running};
+    strncpy(actx.srv_ip, srv_ip, sizeof actx.srv_ip - 1);
+    pthread_t admin_th;
+    if(pthread_create(&admin_th, NULL, admin_thread, &actx) != 0){
+        perror("pthread_create(admin)"); // non fatal
     } else {
-        pthread_detach(bth); // détaché : il finira seul à l'EOF stdin
+        pthread_detach(admin_th); // pas besoin de join
     }
 
+    // Boucle réseau
     char buf[512];
     while (running) {
         struct sockaddr_in cli; socklen_t cl = sizeof cli;
         ssize_t n = recvfrom(s, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
-        if(n<0){ if(errno==EINTR) continue; die_perror("recvfrom"); }
+        if(n<0){
+            if(errno==EINTR) continue;     // interrompu par signal
+            if(errno==EAGAIN || errno==EWOULDBLOCK) continue; // timeout → on re-vérifie running
+            die_perror("recvfrom");
+        }
         buf[n]='\0';
 
         if(!strncmp(buf, "LIST", 4)){
