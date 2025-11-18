@@ -109,8 +109,8 @@ static pid_t spawn_affichage(const char *spec, const char *sem_name){
 }
 
 /* ───────── UI helpers ───────── */
-static inline void ui_prompt(void){
-    printf("\033[2K\rMessage : ");
+static inline void ui_prompt_group(const char *group){
+    printf("\033[2K\rMessage [%s] : ", group);
     fflush(stdout);
 }
 static inline void ui_clear_prevline(void){
@@ -133,7 +133,6 @@ static int group_exists(int s, struct sockaddr_in *srv, const char *gname){
     if(n <= 0) return 0;
     buf[n] = '\0';
 
-    // Parcours de la liste "nom port\n"
     char *save = NULL;
     char *line = strtok_r(buf, "\n", &save);
     while(line){
@@ -148,7 +147,8 @@ static int group_exists(int s, struct sockaddr_in *srv, const char *gname){
 }
 
 /* ───────── Boucle de dialogue ───────── */
-static void dialog_loop(const char *user, int rx, struct sockaddr_in *grp,
+static void dialog_loop(const char *user, const char *group,
+                        int rx, struct sockaddr_in *grp,
                         ISYRing *rb, sem_t *sem,
                         const char *display_spec, const char *sem_name){
     char line[256];
@@ -156,8 +156,9 @@ static void dialog_loop(const char *user, int rx, struct sockaddr_in *grp,
     rb->closed = 0;
     pid_t viewer = spawn_affichage(display_spec, sem_name);
 
+    printf("=== Dialogue sur [%s] ===\n", group);
     puts("Tapez 'quit' pour revenir au menu principal. Tapez 'cmd' pour entrer une commande.");
-    ui_prompt();
+    ui_prompt_group(group);
 
     for(;;){
         if(!fgets(line, sizeof line, stdin)) break;
@@ -190,7 +191,7 @@ static void dialog_loop(const char *user, int rx, struct sockaddr_in *grp,
             if(sendto(rx, out, strlen(out), 0, (struct sockaddr*)grp, sizeof *grp) < 0) die_perror("sendto MSG");
         }
 
-        ui_prompt();
+        ui_prompt_group(group);
     }
 
     rb->closed = 1;
@@ -271,7 +272,7 @@ int main(int argc, char **argv){
                     puts("Vous êtes déjà dans un groupe. Utilisez 5 pour le quitter ou 3 pour dialoguer.");
                     continue;
                 }else{
-                    // le groupe n'existe plus côté serveur → on nettoie l'état local
+                    // groupe supprimé → on nettoie l’état local
                     puts("Le groupe courant n'existe plus (supprimé). Vous n'êtes plus dans aucun groupe.");
                     if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); ctx = NULL; }
                     if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); rb = NULL; }
@@ -365,7 +366,7 @@ int main(int argc, char **argv){
             ctx->rx_sock = rx; ctx->stop = 0; ctx->rb = rb; ctx->sem = sem;
             if(pthread_create(&rx_th, NULL, rx_thread, ctx) != 0) die_perror("pthread_create");
 
-            // auto-enregistrement pour déclencher push des bannières côté groupe
+            // auto-enregistrement → le groupe poussera les bannières actives
             {
                 char hello[128];
                 snprintf(hello, sizeof hello, "MSG %s %s", conf.user, "(joined)");
@@ -373,7 +374,7 @@ int main(int argc, char **argv){
             }
 
             joined = 1;
-            dialog_loop(conf.user, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
+            dialog_loop(conf.user, current_group, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
             continue;
         }
 
@@ -394,13 +395,19 @@ int main(int argc, char **argv){
                 continue;
             }
 
-            dialog_loop(conf.user, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
+            dialog_loop(conf.user, current_group, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
             continue;
         }
 
         /* QUITTER LE GROUPE MANUELLEMENT */
         if(!strcmp(line,"5")){
             if(!joined){ puts("Vous n'êtes dans aucun groupe."); continue; }
+
+            // annonce 'left' au groupe avant de démonter
+            char bye[128];
+            snprintf(bye, sizeof bye, "MSG %s %s", conf.user, "(left)");
+            (void)sendto(rx, bye, strlen(bye), 0, (struct sockaddr*)&grp, sizeof grp);
+
             if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); ctx = NULL; }
             if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); rb = NULL; }
             if(sem){ sem_close(sem); sem = NULL; }
@@ -416,10 +423,15 @@ int main(int argc, char **argv){
         if(!strcmp(line,"4")) break;
     }
 
-    // cleanup global
+    // cleanup global (+ annonce 'left' si encore dans un groupe)
     if(joined){
+        char bye[128];
+        snprintf(bye, sizeof bye, "MSG %s %s", conf.user, "(left)");
+        (void)sendto(rx, bye, strlen(bye), 0, (struct sockaddr*)&grp, sizeof grp);
+
         if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); }
-        if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); }
+        if(rb){ rb->closed = 1; // l'afficheur sera déjà fermé en dehors du dialogue
+            if(sem) sem_post(sem); munmap(rb, sizeof *rb); }
         if(sem){ sem_close(sem); }
     }
     close(rx);
