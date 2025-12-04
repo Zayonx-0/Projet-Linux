@@ -1,6 +1,6 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -pedantic -std=c11
-LIBS = -lpthread
+CFLAGS ?= -O2 -Wall -Wextra -pedantic -std=gnu11
+LIBS = -lpthread -lrt
 
 SRC = src
 
