@@ -2,43 +2,42 @@
 UNAME := $(shell uname)
 WSL   := $(shell grep -qi microsoft /proc/version && echo 1 || echo 0)
 
-# Default values (Linux natif)
+# Default (Linux natif)
 CFLAGS ?= -O2 -Wall -Wextra -pedantic -std=gnu11
 LIBS    = -lpthread -lrt
+PLATFORM_MSG = "[Make] Building for Linux"
 
-# macOS adjustment
+# macOS
 ifeq ($(UNAME),Darwin)
     CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11
     LIBS   = -lpthread
+    PLATFORM_MSG = "[Make] Building for macOS"
 endif
 
-# WSL adjustment (overrides standard Linux)
+# WSL
 ifeq ($(WSL),1)
     CFLAGS = -O2 -Wall -Wextra -pedantic -std=gnu11
     LIBS   = -lpthread -lrt
+    PLATFORM_MSG = "[Make] Building for WSL"
 endif
 
-# Binaries
-SRV = ServeurISY
-GRP = GroupeISY
-CLI = ClientISY
+CC ?= cc
+SRC = src
 
-# Sources
-SRV_SRC = src/ServeurISY.c
-GRP_SRC = src/GroupeISY.c
-CLI_SRC = src/ClientISY.c
+all:
+	@echo $(PLATFORM_MSG)
+	$(MAKE) ServeurISY
+	$(MAKE) GroupeISY
+	$(MAKE) ClientISY
 
-# Default rule
-all: $(SRV) $(GRP) $(CLI)
+ServeurISY: $(SRC)/ServeurISY.c $(SRC)/Commun.h
+	$(CC) $(CFLAGS) -o $@ $(SRC)/ServeurISY.c $(LIBS)
 
-$(SRV): $(SRV_SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+GroupeISY: $(SRC)/GroupeISY.c $(SRC)/Commun.h
+	$(CC) $(CFLAGS) -o $@ $(SRC)/GroupeISY.c $(LIBS)
 
-$(GRP): $(GRP_SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
-
-$(CLI): $(CLI_SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+ClientISY: $(SRC)/ClientISY.c $(SRC)/Commun.h
+	$(CC) $(CFLAGS) -o $@ $(SRC)/ClientISY.c $(LIBS)
 
 clean:
-	rm -f $(SRV) $(GRP) $(CLI)
+	rm -f ServeurISY GroupeISY ClientISY
