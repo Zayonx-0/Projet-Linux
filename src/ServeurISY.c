@@ -1,261 +1,299 @@
 // src/ServeurISY.c
 #include "Commun.h"
+#include <sys/wait.h>
+#include <signal.h>
+#include <arpa/inet.h>
 
-#define MAX_GROUPS 64
+#define MAX_GROUPS_DEFAULT 32
+#define NAME_LEN 32
 
 typedef struct {
-    char name[32];
-    char moderator[EME_LEN];
+    int used;
+    char name[NAME_LEN];
     uint16_t port;
-    pid_t pid;         // PID du processus GroupeISY
-    int active;
-} SrvGroup;
+    pid_t pid;
+    struct sockaddr_in addr; // 127.0.0.1:port (canal admin vers GroupeISY local)
+} GroupRec;
 
-static volatile sig_atomic_t running = 1;
-static volatile sig_atomic_t need_reap = 0;
+/* ───────── Config serveur ───────── */
+typedef struct {
+    char bind_ip[64];         // "0.0.0.0" pour Internet
+    uint16_t server_port;     // port de contrôle (LIST/CREATE/JOIN)
+    uint16_t base_port;       // premier port de groupe (UDP)
+    unsigned max_groups;      // nombre max de groupes
+    unsigned idle_timeout;    // IDLE_TIMEOUT_SEC injecté à GroupeISY
+} ServerConf;
 
-/* ───────── Signals ───────── */
-static void on_sigint(int signo){ (void)signo; running = 0; }
-static void on_sigchld(int signo){ (void)signo; need_reap = 1; }
+static int load_server_conf(const char *path, ServerConf *c){
+    memset(c,0,sizeof *c);
+    strncpy(c->bind_ip, "0.0.0.0", sizeof c->bind_ip - 1);
+    c->server_port = 8000;
+    c->base_port   = 8010;
+    c->max_groups  = MAX_GROUPS_DEFAULT;
+    c->idle_timeout = 1800;
 
-/* ───────── Utils ───────── */
-static void set_rcv_timeout(int sock, int ms){
-    struct timeval tv; tv.tv_sec=ms/1000; tv.tv_usec=(ms%1000)*1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-}
-
-static int load_conf(const char *path,
-                     char *srv_ip, uint16_t *srv_port,
-                     uint16_t *base_port, int *max_groups,
-                     unsigned *idle_timeout_sec)
-{
-    FILE *f = fopen(path, "r"); if(!f) return -1;
+    FILE *f=fopen(path,"r"); if(!f) return -1;
     char line[256], k[64], v[128];
-    while (fgets(line, sizeof line, f)) {
+    while(fgets(line,sizeof line,f)){
         if(line[0]=='#' || strlen(line)<3) continue;
-        if (sscanf(line, "%63[^=]=%127s", k, v)==2) {
-            if (!strcmp(k, "SERVER_IP")) strncpy(srv_ip, v, 63);
-            else if (!strcmp(k, "SERVER_PORT")) *srv_port = (uint16_t)atoi(v);
-            else if (!strcmp(k, "GROUP_BASE_PORT")) *base_port = (uint16_t)atoi(v);
-            else if (!strcmp(k, "MAX_GROUPS")) *max_groups = atoi(v);
-            else if (!strcmp(k, "IDLE_TIMEOUT_SEC")) *idle_timeout_sec = (unsigned)atoi(v);
+        if(sscanf(line, "%63[^=]=%127s", k, v)==2){
+            if(!strcmp(k,"SERVER_IP"))      strncpy(c->bind_ip, v, sizeof c->bind_ip -1);
+            else if(!strcmp(k,"SERVER_PORT")) c->server_port = (uint16_t)atoi(v);
+            else if(!strcmp(k,"BASE_PORT"))   c->base_port   = (uint16_t)atoi(v);
+            else if(!strcmp(k,"MAX_GROUPS"))  c->max_groups  = (unsigned)atoi(v);
+            else if(!strcmp(k,"GROUP_IDLE_TIMEOUT_SEC")) c->idle_timeout = (unsigned)atoi(v);
         }
     }
     fclose(f);
+    if(c->max_groups==0 || c->max_groups>256) c->max_groups = MAX_GROUPS_DEFAULT;
     return 0;
 }
 
-/* ───────── Broadcast helper (admin console -> groupes) ───────── */
-static void send_to_all_groups(int sock, const char *srv_ip, SrvGroup *groups, int max_groups, const char *payload){
-    for(int i=0;i<max_groups;i++){
-        if(!groups[i].active) continue;
-        struct sockaddr_in g = {0};
-        g.sin_family = AF_INET;
-        g.sin_port   = htons(groups[i].port);
-        if(inet_pton(AF_INET, srv_ip, &g.sin_addr) != 1) continue;
-        (void)sendto(sock, payload, strlen(payload), 0, (struct sockaddr*)&g, sizeof g);
-    }
-}
+/* ───────── Etat global ───────── */
+static volatile sig_atomic_t running = 1;
+static GroupRec *groups = NULL;
+static unsigned GMAX = 0;
+static int sock_ctrl = -1;          // socket UDP de contrôle (clients ↔ serveur)
+static ServerConf gconf;
 
-/* ───────── Admin console thread ─────────
-   Commandes:
-     /ban <texte>   → CTRL BANNER_SET <texte>
-     /banoff        → CTRL BANNER_CLR
-     <texte libre>  → SYS <texte> (non-collant)
-*/
-typedef struct {
-    int sock;
-    char srv_ip[64];
-    SrvGroup *groups;
-    int max_groups;
-    volatile sig_atomic_t *runflag;
-} AdminCtx;
-
-static void *admin_thread(void *arg){
-    AdminCtx *ctx = (AdminCtx*)arg;
-    char *line = NULL; size_t cap = 0;
-
-    fprintf(stdout,
-        "[ADMIN] Commandes:\n"
-        "  /ban <texte>   → bannière collante pour tous\n"
-        "  /banoff        → retirer la bannière\n"
-        "  <texte libre>  → message live non collant (SYS)\n");
-    fflush(stdout);
-
-    while(*(ctx->runflag)){
-        errno = 0;
-        ssize_t n = getline(&line, &cap, stdin);
-        if(n <= 0){
-            if(errno == EINTR) continue;
-            break; // EOF
-        }
-        trimnl(line);
-        if(line[0] == '\0') continue;
-
-        if(!strncmp(line, "/banoff", 7)){
-            char payload[] = "CTRL BANNER_CLR";
-            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
-            fprintf(stdout, "[ADMIN] Bannière retirée.\n"); fflush(stdout);
-        }else if(!strncmp(line, "/ban ", 5)){
-            char payload[512];
-            snprintf(payload, sizeof payload, "CTRL BANNER_SET %s", line+5);
-            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
-            fprintf(stdout, "[ADMIN] Bannière posée.\n"); fflush(stdout);
-        }else{
-            char payload[512];
-            snprintf(payload, sizeof payload, "SYS %s", line);
-            send_to_all_groups(ctx->sock, ctx->srv_ip, ctx->groups, ctx->max_groups, payload);
-        }
-    }
-
-    free(line);
-    return NULL;
-}
-
-/* ───────── Reap children + nettoyer la table des groupes ───────── */
-static void reap_dead_groups(SrvGroup *groups, int max_groups){
-    int status;
-    pid_t pid;
-    while((pid = waitpid(-1, &status, WNOHANG)) > 0){
-        for(int i=0;i<max_groups;i++){
-            if(groups[i].active && groups[i].pid == pid){
-                groups[i].active = 0;
-                groups[i].pid = 0;
-                groups[i].name[0] = '\0';
-                groups[i].moderator[0] = '\0';
-                groups[i].port = 0;
-                fprintf(stdout, "ServeurISY: groupe fils %d terminé, slot libéré.\n", (int)pid);
-                fflush(stdout);
-                break;
+static void on_sigint(int s){ (void)s; running = 0; }
+static void on_sigchld(int s){
+    (void)s;
+    // reap non bloquant
+    for(;;){
+        int status;
+        pid_t p = waitpid(-1, &status, WNOHANG);
+        if(p<=0) break;
+        // libérer le slot
+        for(unsigned i=0;i<GMAX;i++){
+            if(groups[i].used && groups[i].pid == p){
+                fprintf(stderr, "[Serveur] Groupe '%s' (port %u) termine.\n",
+                        groups[i].name, (unsigned)groups[i].port);
+                groups[i].used = 0;
+                groups[i].pid = -1;
             }
         }
     }
+}
+
+/* ───────── Helpers groupes ───────── */
+static int find_group_by_name(const char *name){
+    for(unsigned i=0;i<GMAX;i++){
+        if(groups[i].used && !strcmp(groups[i].name, name)) return (int)i;
+    }
+    return -1;
+}
+static int find_free_slot(void){
+    for(unsigned i=0;i<GMAX;i++) if(!groups[i].used) return (int)i;
+    return -1;
+}
+
+static int spawn_group(const char *name, uint16_t port, unsigned idle_sec, pid_t *outpid){
+    pid_t p = fork();
+    if(p<0) return -1;
+    if(p==0){
+        char pstr[16], tstr[16];
+        snprintf(pstr,sizeof pstr,"%u",(unsigned)port);
+        snprintf(tstr,sizeof tstr,"%u",(unsigned)idle_sec);
+        execl("./GroupeISY","GroupeISY",name,pstr,tstr,(char*)NULL);
+        _exit(127);
+    }
+    *outpid = p;
+    return 0;
+}
+
+static void broadcast_to_groups(const char *payload){
+    for(unsigned i=0;i<GMAX;i++){
+        if(!groups[i].used) continue;
+        sendto(sock_ctrl, payload, strlen(payload), 0,
+               (struct sockaddr*)&groups[i].addr, sizeof groups[i].addr);
+    }
+}
+
+/* ───────── Thread input admin ─────────
+   Commandes console:
+     /banner <texte>     -> CTRL BANNER_SET à tous les groupes
+     /banner_clr         -> CTRL BANNER_CLR
+     /sys <texte>        -> SYS <texte> à tous les groupes
+     /list               -> affiche la table groupes
+     /quit               -> arrêt du serveur (Ctrl-C pareil)
+*/
+static void *admin_input_thread(void *arg){
+    (void)arg;
+    char line[1024];
+    while(running && fgets(line,sizeof line, stdin)){
+        trimnl(line);
+        if(!strncmp(line,"/banner ",8)){
+            char out[1100]; snprintf(out,sizeof out,"CTRL BANNER_SET %s", line+8);
+            broadcast_to_groups(out);
+            fprintf(stderr,"[Serveur] Banner SET broadcast.\n");
+        }else if(!strcmp(line,"/banner_clr")){
+            broadcast_to_groups("CTRL BANNER_CLR");
+            fprintf(stderr,"[Serveur] Banner CLR broadcast.\n");
+        }else if(!strncmp(line,"/sys ",5)){
+            char out[1100]; snprintf(out,sizeof out,"SYS %s", line+5);
+            broadcast_to_groups(out);
+            fprintf(stderr,"[Serveur] SYS broadcast.\n");
+        }else if(!strcmp(line,"/list")){
+            fprintf(stderr,"[Serveur] Groupes actifs:\n");
+            for(unsigned i=0;i<GMAX;i++){
+                if(groups[i].used){
+                    fprintf(stderr,"  - %s  %u  (pid=%d)\n",
+                            groups[i].name, (unsigned)groups[i].port, (int)groups[i].pid);
+                }
+            }
+        }else if(!strcmp(line,"/quit")){
+            running = 0;
+            break;
+        }else if(line[0]){
+            fprintf(stderr,"[Serveur] Commandes: /banner <txt> | /banner_clr | /sys <txt> | /list | /quit\n");
+        }
+    }
+    return NULL;
 }
 
 /* ───────── Main ───────── */
 int main(int argc, char **argv){
-    if(argc<2){ fprintf(stderr, "Usage: %s conf/server.conf\n", argv[0]); return 1; }
+    if(argc<2){
+        fprintf(stderr,"Usage: %s conf/server.conf\n", argv[0]);
+        return 1;
+    }
+    if(load_server_conf(argv[1], &gconf)<0) die_perror("server conf");
 
-    /* Config par défaut */
-    char srv_ip[64]="127.0.0.1";
-    uint16_t srv_port=8000, base_port=8010;
-    int max_groups=16;
-    unsigned idle_timeout_sec = 1800; // 30 min par défaut
-
-    if (load_conf(argv[1], srv_ip, &srv_port, &base_port, &max_groups, &idle_timeout_sec)<0)
-        die_perror("server conf");
-    if(max_groups > MAX_GROUPS) max_groups = MAX_GROUPS;
-
-    /* Signals */
+    // install signals
     struct sigaction sa; memset(&sa,0,sizeof sa);
     sa.sa_handler = on_sigint; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
-
+    sigaction(SIGTERM,&sa, NULL);
     struct sigaction sc; memset(&sc,0,sizeof sc);
-    sc.sa_handler = on_sigchld; sigemptyset(&sc.sa_mask);
-    sc.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sc.sa_handler = on_sigchld; sigemptyset(&sc.sa_mask); sc.sa_flags = SA_RESTART|SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sc, NULL);
 
-    /* Socket UDP serveur */
-    int s = socket(AF_INET, SOCK_DGRAM, 0); if(s<0) die_perror("socket");
-    set_rcv_timeout(s, 500);
-    struct sockaddr_in addr; memset(&addr,0,sizeof addr);
-    addr.sin_family=AF_INET; addr.sin_port=htons(srv_port);
-    if (inet_pton(AF_INET, srv_ip, &addr.sin_addr) != 1) die_perror("inet_pton");
-    if (bind(s, (struct sockaddr*)&addr, sizeof addr)<0) die_perror("bind server");
+    // state
+    GMAX = gconf.max_groups;
+    groups = (GroupRec*)calloc(GMAX, sizeof *groups);
+    if(!groups){ perror("calloc groups"); return 1; }
 
-    SrvGroup groups[MAX_GROUPS]; memset(groups,0,sizeof groups);
-    uint16_t next_port = base_port;
+    // socket contrôle (UDP)
+    sock_ctrl = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sock_ctrl<0) die_perror("socket");
 
-    fprintf(stdout, "ServeurISY: %s:%u prêt (IDLE_TIMEOUT_SEC=%u)\n",
-            srv_ip, (unsigned)srv_port, idle_timeout_sec);
+    int yes=1; setsockopt(sock_ctrl, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
 
-    /* Thread admin console */
-    AdminCtx actx = {.sock=s, .groups=groups, .max_groups=max_groups, .runflag=&running};
-    strncpy(actx.srv_ip, srv_ip, sizeof actx.srv_ip - 1);
-    pthread_t admin_th;
-    if(pthread_create(&admin_th, NULL, admin_thread, &actx) != 0){
-        perror("pthread_create(admin)");
-    } else {
-        pthread_detach(admin_th);
-    }
+    struct sockaddr_in srv={0};
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(gconf.server_port);
+    if(!strcmp(gconf.bind_ip,"0.0.0.0")) srv.sin_addr.s_addr = htonl(INADDR_ANY);
+    else if(inet_pton(AF_INET, gconf.bind_ip, &srv.sin_addr)!=1) die_perror("inet_pton bind");
+    if(bind(sock_ctrl, (struct sockaddr*)&srv, sizeof srv)<0) die_perror("bind server");
 
-    /* Boucle réseau */
-    char buf[512];
-    while (running) {
-        if(need_reap){ reap_dead_groups(groups, max_groups); need_reap = 0; }
+    // thread input admin
+    pthread_t th_in; pthread_create(&th_in, NULL, admin_input_thread, NULL);
 
-        struct sockaddr_in cli; socklen_t cl = sizeof cli;
-        ssize_t n = recvfrom(s, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
+    fprintf(stderr,"[Serveur] écoute UDP %s:%u  | groupes %u..%u  | idle=%us\n",
+            gconf.bind_ip, (unsigned)gconf.server_port,
+            (unsigned)gconf.base_port, (unsigned)(gconf.base_port+GMAX-1),
+            gconf.idle_timeout);
+
+    // boucle contrôle
+    char buf[1024];
+    while(running){
+        struct sockaddr_in cli; socklen_t cl=sizeof cli;
+        ssize_t n = recvfrom(sock_ctrl, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
         if(n<0){
             if(errno==EINTR) continue;
-            if(errno==EAGAIN || errno==EWOULDBLOCK) continue;
             die_perror("recvfrom");
         }
         buf[n]='\0';
 
-        if(!strncmp(buf, "LIST", 4)){
-            char out[1024]; out[0]='\0';
-            int empty=1;
-            for(int i=0;i<max_groups;i++){
-                if(groups[i].active){
-                    empty=0;
-                    char line[96];
-                    snprintf(line,sizeof line,"%s %u\n", groups[i].name, groups[i].port);
-                    strncat(out,line,sizeof out - strlen(out) -1);
+        // Commandes clients: CREATE <name> | LIST | JOIN <name> <user> <cip> <cport>
+        if(!strncmp(buf,"LIST",4)){
+            char out[4096]; out[0]='\0';
+            for(unsigned i=0;i<GMAX;i++){
+                if(groups[i].used){
+                    char line[64];
+                    snprintf(line,sizeof line,"%s %u\n", groups[i].name, (unsigned)groups[i].port);
+                    strncat(out,line,sizeof out - strlen(out) - 1);
                 }
             }
-            if(empty) strcpy(out,"Aucun groupe\n");
-            sendto(s, out, strlen(out), 0, (struct sockaddr*)&cli, cl);
+            if(out[0]=='\0') strcpy(out,"(aucun)\n");
+            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
 
-        } else if(!strncmp(buf, "CREATE ", 7)){
-            char gname[32]={0};
-            if(sscanf(buf+7, "%31s", gname)!=1){
-                const char*e="ERR bad CREATE\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl); continue;
+        }else if(!strncmp(buf,"CREATE ",7)){
+            char gname[NAME_LEN]={0};
+            if(sscanf(buf+7,"%31s", gname)!=1) continue;
+
+            int idx = find_group_by_name(gname);
+            if(idx>=0){
+                char out[128];
+                snprintf(out,sizeof out,"OK %s %u", groups[idx].name, (unsigned)groups[idx].port);
+                sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+                continue;
             }
-            int slot=-1; for(int i=0;i<max_groups;i++) if(!groups[i].active){ slot=i; break; }
-            if(slot<0){ const char*e="ERR no slot\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl); continue; }
-            int dup=0; for(int i=0;i<max_groups;i++) if(groups[i].active && !strcmp(groups[i].name,gname)) dup=1;
-            if(dup){ const char*e="ERR exists\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl); continue; }
-
-            uint16_t gport = next_port++;
-            pid_t pid = fork();
-            if(pid<0) die_perror("fork");
-            if(pid==0){
-                char pbuf[16]; snprintf(pbuf,sizeof pbuf, "%u", gport);
-                char tbuf[16]; snprintf(tbuf,sizeof tbuf, "%u", idle_timeout_sec);
-                execl("./GroupeISY", "GroupeISY", gname, pbuf, tbuf, (char*)NULL);
-                die_perror("execl GroupeISY");
+            int freei = find_free_slot();
+            if(freei<0){
+                const char *err = "ERR no_slot";
+                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                continue;
             }
-            strncpy(groups[slot].name, gname, sizeof groups[slot].name-1);
-            groups[slot].moderator[0]='\0';
-            groups[slot].port = gport;
-            groups[slot].pid  = pid;
-            groups[slot].active=1;
-            char ok[64]; snprintf(ok, sizeof ok, "OK %s %u\n", gname, gport);
-            sendto(s, ok, strlen(ok), 0, (struct sockaddr*)&cli, cl);
-
-        } else if(!strncmp(buf, "JOIN ", 5)){
-            char gname[32], user[32], cip[64]; int cport=0;
-            if(sscanf(buf+5, "%31s %31s %63s %d", gname, user, cip, &cport)!=4){
-                const char*e="ERR bad JOIN\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl); continue;
+            uint16_t port = gconf.base_port + (uint16_t)freei;
+            pid_t pid;
+            if(spawn_group(gname, port, gconf.idle_timeout, &pid)<0){
+                const char *err = "ERR spawn";
+                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                continue;
             }
-            int found=-1; for(int i=0;i<max_groups;i++) if(groups[i].active && !strcmp(groups[i].name,gname)){ found=i; break; }
-            if(found<0){ const char*e="ERR no group\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl); continue; }
-            char ok[128]; snprintf(ok,sizeof ok, "OK %s %u\n", groups[found].name, groups[found].port);
-            sendto(s, ok, strlen(ok), 0, (struct sockaddr*)&cli, cl);
+            groups[freei].used = 1;
+            groups[freei].pid  = pid;
+            groups[freei].port = port;
+            strncpy(groups[freei].name, gname, NAME_LEN-1);
 
-        } else if(!strncmp(buf, "QUIT ", 5)){
-            const char*ok="OK bye\n"; sendto(s,ok,strlen(ok),0,(struct sockaddr*)&cli,cl);
+            // addr d'admin -> 127.0.0.1:port (le groupe écoute localement)
+            memset(&groups[freei].addr,0,sizeof groups[freei].addr);
+            groups[freei].addr.sin_family = AF_INET;
+            groups[freei].addr.sin_port   = htons(port);
+            inet_pton(AF_INET, "127.0.0.1", &groups[freei].addr.sin_addr);
 
-        } else {
-            const char*e="ERR unknown\n"; sendto(s,e,strlen(e),0,(struct sockaddr*)&cli,cl);
+            char out[128];
+            snprintf(out,sizeof out,"OK %s %u", gname, (unsigned)port);
+            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+
+        }else if(!strncmp(buf,"JOIN ",5)){
+            char gname[NAME_LEN]={0}, user[EME_LEN]={0}, cip[64]={0};
+            unsigned cport=0;
+            // On ignore cip/cport (le GroupeISY prend l'adresse depuis recvfrom)
+            if(sscanf(buf+5,"%31s %19s %63s %u", gname, user, cip, &cport) < 2) continue;
+
+            int idx = find_group_by_name(gname);
+            if(idx<0){
+                const char *err="ERR notfound";
+                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                continue;
+            }
+            char out[128];
+            snprintf(out,sizeof out,"OK %s %u", groups[idx].name, (unsigned)groups[idx].port);
+            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+
+        }else{
+            // commande inconnue -> ignore
         }
     }
 
-    /* Reap restants (arrêt) */
-    reap_dead_groups(groups, max_groups);
-    close(s);
-    fprintf(stdout, "ServeurISY: arrêt propre.\n");
+    // arrêt : tuer les groupes encore vivants
+    fprintf(stderr,"[Serveur] arrêt…\n");
+    for(unsigned i=0;i<GMAX;i++){
+        if(groups[i].used){
+            kill(groups[i].pid, SIGINT);
+        }
+    }
+    // attendre un peu
+    for(unsigned i=0;i<GMAX;i++){
+        if(groups[i].used){
+            int st; waitpid(groups[i].pid, &st, 0);
+        }
+    }
+
+    if(sock_ctrl>=0) close(sock_ctrl);
+    free(groups);
     return 0;
 }

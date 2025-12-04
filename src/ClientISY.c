@@ -3,6 +3,23 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <sys/wait.h>
+#include <signal.h>
+
+/* ───────── État global pour quitter proprement sur Ctrl+C ───────── */
+static int g_joined = 0;
+static int g_rx_sock = -1;
+static struct sockaddr_in g_grp;
+static char g_user[EME_LEN];
+
+static void on_sig(int signo){
+    (void)signo;
+    if(g_joined && g_rx_sock >= 0){
+        char bye[128];
+        snprintf(bye, sizeof bye, "MSG %s %s", g_user, "(left)");
+        sendto(g_rx_sock, bye, strlen(bye), 0, (struct sockaddr*)&g_grp, sizeof g_grp);
+    }
+    _exit(0);
+}
 
 /* ───────── Config ───────── */
 typedef struct {
@@ -207,7 +224,10 @@ int main(int argc, char **argv){
     ClientConf conf;
     if(load_conf(argv[1], &conf) < 0) die_perror("client conf");
 
-    // socket → serveur
+    strncpy(g_user, conf.user, EME_LEN-1);
+    g_user[EME_LEN-1] = '\0';
+
+    // socket → serveur (UDP)
     int s = socket(AF_INET, SOCK_DGRAM, 0); if(s<0) die_perror("socket srv");
     struct sockaddr_in srv; memset(&srv,0,sizeof srv);
     srv.sin_family = AF_INET; srv.sin_port = htons(conf.srv_port);
@@ -215,10 +235,19 @@ int main(int argc, char **argv){
 
     // socket local RX (bind sur LOCAL_RECV_PORT)
     int rx = socket(AF_INET, SOCK_DGRAM, 0); if(rx<0) die_perror("socket rx");
+    g_rx_sock = rx; // pour le handler signal
+
     struct sockaddr_in laddr; memset(&laddr,0,sizeof laddr);
     laddr.sin_family = AF_INET; laddr.sin_port = htons(conf.local_port);
     laddr.sin_addr.s_addr = htonl(INADDR_ANY);
     if(bind(rx, (struct sockaddr*)&laddr, sizeof laddr) < 0) die_perror("bind rx");
+
+    // handler SIGINT/SIGTERM/SIGHUP -> envoi "(left)"
+    struct sigaction sa; memset(&sa,0,sizeof sa);
+    sa.sa_handler = on_sig; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     /* État session */
     int joined = 0;
@@ -272,7 +301,6 @@ int main(int argc, char **argv){
                     puts("Vous êtes déjà dans un groupe. Utilisez 5 pour le quitter ou 3 pour dialoguer.");
                     continue;
                 }else{
-                    // groupe supprimé → on nettoie l’état local
                     puts("Le groupe courant n'existe plus (supprimé). Vous n'êtes plus dans aucun groupe.");
                     if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); ctx = NULL; }
                     if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); rb = NULL; }
@@ -281,6 +309,7 @@ int main(int argc, char **argv){
                     sem_name_saved[0]='\0';
                     display_spec_saved[0]='\0';
                     joined = 0;
+                    g_joined = 0;
                 }
             }
 
@@ -289,9 +318,13 @@ int main(int argc, char **argv){
             if(!fgets(gname,sizeof gname, stdin)) continue; 
             trimnl(gname);
 
-            char cip[64] = "127.0.0.1";
+            // ces champs ne sont pas utilisés par le groupe (il prend l'adresse depuis recvfrom),
+            // on envoie une valeur neutre
+            const char *cip = "0.0.0.0";
+            unsigned cport = 0;
+
             char cmd[256];
-            snprintf(cmd, sizeof cmd, "JOIN %s %s %s %u", gname, conf.user, cip, (unsigned)conf.local_port);
+            snprintf(cmd, sizeof cmd, "JOIN %s %s %s %u", gname, conf.user, cip, cport);
             if(sendto(s, cmd, strlen(cmd), 0, (struct sockaddr*)&srv, sizeof srv) < 0) die_perror("sendto JOIN");
 
             char buf[256]; struct sockaddr_in from; socklen_t fl=sizeof from;
@@ -304,8 +337,11 @@ int main(int argc, char **argv){
                 puts("ERR JOIN"); current_group[0]='\0'; continue;
             }
 
-            grp.sin_family = AF_INET; grp.sin_port = htons((uint16_t)gport);
-            if(inet_pton(AF_INET, "127.0.0.1", &grp.sin_addr) != 1) die_perror("inet_pton grp");
+            grp.sin_family = AF_INET; 
+            grp.sin_port   = htons((uint16_t)gport);
+            /* >>> Internet : envoyer au serveur public, pas à 127.0.0.1 */
+            if(inet_pton(AF_INET, conf.srv_ip, &grp.sin_addr) != 1) die_perror("inet_pton grp");
+            g_grp = grp;   // pour le handler signal
 
             printf("Connexion au groupe %s realisee , lancement de l affichage\n", current_group);
 
@@ -374,6 +410,8 @@ int main(int argc, char **argv){
             }
 
             joined = 1;
+            g_joined = 1;
+
             dialog_loop(conf.user, current_group, rx, &grp, rb, sem, display_spec_saved, sem_name_saved);
             continue;
         }
@@ -392,6 +430,7 @@ int main(int argc, char **argv){
                 sem_name_saved[0]='\0';
                 display_spec_saved[0]='\0';
                 joined = 0;
+                g_joined = 0;
                 continue;
             }
 
@@ -403,7 +442,6 @@ int main(int argc, char **argv){
         if(!strcmp(line,"5")){
             if(!joined){ puts("Vous n'êtes dans aucun groupe."); continue; }
 
-            // annonce 'left' au groupe avant de démonter
             char bye[128];
             snprintf(bye, sizeof bye, "MSG %s %s", conf.user, "(left)");
             (void)sendto(rx, bye, strlen(bye), 0, (struct sockaddr*)&grp, sizeof grp);
@@ -415,6 +453,7 @@ int main(int argc, char **argv){
             sem_name_saved[0]='\0';
             display_spec_saved[0]='\0';
             joined = 0;
+            g_joined = 0;
             puts("Groupe quitté.");
             continue;
         }
@@ -430,8 +469,7 @@ int main(int argc, char **argv){
         (void)sendto(rx, bye, strlen(bye), 0, (struct sockaddr*)&grp, sizeof grp);
 
         if(ctx){ ctx->stop = 1; pthread_join(rx_th, NULL); free(ctx); }
-        if(rb){ rb->closed = 1; // l'afficheur sera déjà fermé en dehors du dialogue
-            if(sem) sem_post(sem); munmap(rb, sizeof *rb); }
+        if(rb){ rb->closed = 1; if(sem) sem_post(sem); munmap(rb, sizeof *rb); }
         if(sem){ sem_close(sem); }
     }
     close(rx);

@@ -1,5 +1,28 @@
 // src/GroupeISY.c
 #include "Commun.h"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ────────────────────────────────────────────────────────────────────────────
+   GroupeISY  —  tourne sur la machine serveur (IP publique).
+   - UDP bind sur <port_groupe> ; reçoit MSG/CMD/CTRL/SYS des clients/serveur.
+   - Push auto des bannières actives aux clients qui (re)joignent.
+   - Bannière d’inactivité (avertissement + suppression).
+   - Préfixe explicite GROUPE[<nom>] dans tous les messages visibles.
+   - Message d’expiration avec consigne "quit".
+   Arguments:
+      argv[1] = nom_groupe
+      argv[2] = port_groupe (UDP)
+      argv[3] = IDLE_TIMEOUT_SEC (optionnel)
+   ─────────────────────────────────────────────────────────────────────────── */
 
 #define MAX_MEMBERS 64
 
@@ -17,7 +40,7 @@ static void on_sigint(int signo){ (void)signo; running = 0; }
 
 /* ───────── Utils ───────── */
 static void set_rcv_timeout(int sock, int ms){
-    struct timeval tv; tv.tv_sec=ms/1000; tv.tv_usec=(ms%1000)*1000;
+    struct timeval tv; tv.tv_sec = ms/1000; tv.tv_usec = (ms%1000)*1000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 static inline void send_txt(int s, const char *txt, const struct sockaddr_in *to){
@@ -37,12 +60,12 @@ static int  idle_banner_active = 0;
 static char idle_banner[TXT_LEN];
 
 /* Inactivité */
-static unsigned idle_timeout_sec = 1800; // par défaut; valeur réelle fournie par argv[3]
-static time_t   last_activity = 0;
+static unsigned idle_timeout_sec = 1800;    // valeur effective injectée par argv[3]
+static time_t   last_activity     = 0;
 
-/* Métadonnées groupe */
-static char gname_local[32] = {0};
-static uint16_t gport_local = 0;
+/* Métadonnées */
+static char     gname_local[32] = {0};
+static uint16_t gport_local     = 0;
 
 /* ───────── Broadcast helpers ───────── */
 static void broadcast_to_all(int s, const char *payload){
@@ -57,9 +80,7 @@ static void unicast_to(int s, const char *payload, const struct sockaddr_in *to)
 }
 
 /* ───────── Thread Timer Inactivité ───────── */
-typedef struct {
-    int sock;
-} TimerCtx;
+typedef struct { int sock; } TimerCtx;
 
 static void fmt_hhmmss(time_t t, char *out, size_t n){
     struct tm tmv; localtime_r(&t, &tmv);
@@ -76,14 +97,12 @@ static void *idle_timer_thread(void *arg){
 
         time_t now = time(NULL);
         int do_exit = 0, need_warn = 0, need_clear = 0;
-        char warn_payload[512];
+        char warn_payload[TXT_LEN + 32];
 
         pthread_mutex_lock(&mtx);
         time_t since = now - last_activity;
 
-        if(idle_timeout_sec == 0){
-            // pas de surveillance
-        }else{
+        if(idle_timeout_sec > 0){
             if(since >= (time_t)idle_timeout_sec){
                 if(idle_banner_active) need_clear = 1;
                 do_exit = 1;
@@ -91,9 +110,12 @@ static void *idle_timer_thread(void *arg){
                 if(!idle_banner_active){
                     time_t deletion_time = last_activity + (time_t)idle_timeout_sec;
                     char hhmmss[16]; fmt_hhmmss(deletion_time, hhmmss, sizeof hhmmss);
+
+                    /* Message court pour éviter la troncature dans petits terminaux */
                     snprintf(idle_banner, sizeof idle_banner,
-                             " Inactivite detectee: le groupe '%s' sera supprime a %s sans activite.",
+                             "Inactivite detectee: le groupe '%s' sera supprime a %s sans activite.",
                              gname_local, hhmmss);
+
                     idle_banner_active = 1;
                     snprintf(warn_payload, sizeof warn_payload, "CTRL IBANNER_SET %s", idle_banner);
                     need_warn = 1;
@@ -114,7 +136,8 @@ static void *idle_timer_thread(void *arg){
         }
         if(do_exit){
             pthread_mutex_lock(&mtx);
-            broadcast_to_all(ctx->sock, "SYS Le groupe est supprime pour cause d'inactivite. Tappez \"quit\" pour quitter.");
+            broadcast_to_all(ctx->sock,
+              "SYS Le groupe est supprime pour cause d'inactivite. Tappez \"quit\" pour quitter.");
             pthread_mutex_unlock(&mtx);
             running = 0;
             break;
@@ -147,17 +170,18 @@ int main(int argc, char **argv){
     struct sockaddr_in addr={0};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(gport);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);        /* écoute sur toutes les interfaces */
     if(bind(s,(struct sockaddr*)&addr,sizeof addr)<0) die_perror("bind group");
 
     memset(members,0,sizeof members);
     admin_banner_active = 0; admin_banner[0]='\0';
     idle_banner_active  = 0; idle_banner[0]='\0';
-    last_activity = time(NULL);
+    last_activity       = time(NULL);
 
-    fprintf(stdout, "GroupeISY '%s' lancé sur %u (IDLE_TIMEOUT_SEC=%u)\n",
+    fprintf(stdout, "GroupeISY '%s' lance sur %u (IDLE_TIMEOUT_SEC=%u)\n",
             gname, (unsigned)gport, idle_timeout_sec);
 
+    /* Timer d’inactivité */
     pthread_t th_timer;
     TimerCtx tctx = {.sock = s};
     if(pthread_create(&th_timer, NULL, idle_timer_thread, &tctx) != 0){
@@ -166,7 +190,7 @@ int main(int argc, char **argv){
         pthread_detach(th_timer);
     }
 
-    char buf[512];
+    char buf[TXT_LEN + 64];
     while(running){
         struct sockaddr_in cli; socklen_t cl=sizeof cli;
         ssize_t n = recvfrom(s, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
@@ -200,7 +224,8 @@ int main(int argc, char **argv){
 
             int idx=-1; int is_new = 0;
             pthread_mutex_lock(&mtx);
-            for(int i=0;i<MAX_MEMBERS;i++) if(members[i].inuse && !strcmp(members[i].user,user)){ idx=i; break; }
+            for(int i=0;i<MAX_MEMBERS;i++)
+                if(members[i].inuse && !strcmp(members[i].user,user)){ idx=i; break; }
             if(idx<0){
                 for(int i=0;i<MAX_MEMBERS;i++) if(!members[i].inuse){
                     idx=i;
@@ -211,32 +236,32 @@ int main(int argc, char **argv){
                 }
             }
             if(idx>=0){
-                members[idx].addr = cli;
+                members[idx].addr = cli;   /* origin = adresse réelle (NAT ok) */
             }
             int banned = (idx>=0 ? members[idx].banned : 1);
             pthread_mutex_unlock(&mtx);
             if(idx<0 || banned) continue;
 
-            /* → ICI : envoi systématique des bannières actives quand le client (re)joint
-               On utilise le message spécial "(joined)" comme handshake.
-               - is_new == 1 : premier seen → on push l'état
-               - text == "(joined)" : rejoin / nouveau client → on push aussi
-            */
+            /* Push bannière(s) au client qui (re)joint.
+               On repère "(joined)" en texte, + is_new pour first seen. */
             int is_join_msg = !strcmp(text, "(joined)");
             if(is_new || is_join_msg){
                 pthread_mutex_lock(&mtx);
                 if(admin_banner_active){
-                    char ctrl[512]; snprintf(ctrl,sizeof ctrl, "CTRL BANNER_SET %s", admin_banner);
+                    char ctrl[TXT_LEN + 32];
+                    snprintf(ctrl,sizeof ctrl, "CTRL BANNER_SET %s", admin_banner);
                     unicast_to(s, ctrl, &members[idx].addr);
                 }
                 if(idle_banner_active){
-                    char ctrl[512]; snprintf(ctrl,sizeof ctrl, "CTRL IBANNER_SET %s", idle_banner);
+                    char ctrl[TXT_LEN + 32];
+                    snprintf(ctrl,sizeof ctrl, "CTRL IBANNER_SET %s", idle_banner);
                     unicast_to(s, ctrl, &members[idx].addr);
                 }
                 pthread_mutex_unlock(&mtx);
             }
 
-            char out[256]; snprintf(out,sizeof out,"GROUPE: Message de %s : %s", user, text);
+            char out[TXT_LEN + 64];
+            snprintf(out,sizeof out,"GROUPE[%s]: Message de %s : %s", gname_local, user, text);
             unicast_to(s, out, &cli);
 
             pthread_mutex_lock(&mtx);
@@ -273,11 +298,12 @@ int main(int argc, char **argv){
                 unicast_to(s,out,&cli);
             }
 
-        /* ── SYS <texte...> (live non-collant) ────────────────────── */
+        /* ── SYS <texte...> ────────────────────────────────────────── */
         } else if(!strncmp(buf, "SYS ", 4)){
             const char *text = buf + 4;
             if(*text == '\0') continue;
-            char out[256]; snprintf(out,sizeof out,"Message de [SERVER] : %s", text);
+            char out[TXT_LEN + 64];
+            snprintf(out,sizeof out,"GROUPE[%s]: Message de [SERVER] : %s", gname_local, text);
             pthread_mutex_lock(&mtx);
             broadcast_to_all(s,out);
             pthread_mutex_unlock(&mtx);
@@ -309,6 +335,7 @@ int main(int argc, char **argv){
                 broadcast_to_all(s, buf);
                 pthread_mutex_unlock(&mtx);
             } else {
+                /* relai brut si autre CTRL */
                 pthread_mutex_lock(&mtx);
                 broadcast_to_all(s, buf);
                 pthread_mutex_unlock(&mtx);
@@ -317,6 +344,6 @@ int main(int argc, char **argv){
     }
 
     close(s);
-    fprintf(stdout, "GroupeISY '%s' arrêt.\n", gname);
+    fprintf(stdout, "GroupeISY '%s' arret.\n", gname);
     return 0;
 }
