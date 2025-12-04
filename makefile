@@ -1,22 +1,44 @@
-CC ?= cc
+# Detect OS
+UNAME := $(shell uname)
+WSL   := $(shell grep -qi microsoft /proc/version && echo 1 || echo 0)
+
+# Default values (Linux natif)
 CFLAGS ?= -O2 -Wall -Wextra -pedantic -std=gnu11
-LIBS = -lpthread -lrt
+LIBS    = -lpthread -lrt
 
-SRC = src
+# macOS adjustment
+ifeq ($(UNAME),Darwin)
+    CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11
+    LIBS   = -lpthread
+endif
 
-all: ServeurISY GroupeISY ClientISY AffichageISY
+# WSL adjustment (overrides standard Linux)
+ifeq ($(WSL),1)
+    CFLAGS = -O2 -Wall -Wextra -pedantic -std=gnu11
+    LIBS   = -lpthread -lrt
+endif
 
-ServeurISY: $(SRC)/ServeurISY.c $(SRC)/Commun.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/ServeurISY.c $(LIBS)
+# Binaries
+SRV = ServeurISY
+GRP = GroupeISY
+CLI = ClientISY
 
-GroupeISY: $(SRC)/GroupeISY.c $(SRC)/Commun.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/GroupeISY.c $(LIBS)
+# Sources
+SRV_SRC = src/ServeurISY.c
+GRP_SRC = src/GroupeISY.c
+CLI_SRC = src/ClientISY.c
 
-ClientISY: $(SRC)/ClientISY.c $(SRC)/Commun.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/ClientISY.c $(LIBS)
+# Default rule
+all: $(SRV) $(GRP) $(CLI)
 
-AffichageISY: $(SRC)/AffichageISY.c $(SRC)/Commun.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/AffichageISY.c $(LIBS)
+$(SRV): $(SRV_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+$(GRP): $(GRP_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+$(CLI): $(CLI_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 clean:
-	rm -f ServeurISY GroupeISY ClientISY AffichageISY
+	rm -f $(SRV) $(GRP) $(CLI)
