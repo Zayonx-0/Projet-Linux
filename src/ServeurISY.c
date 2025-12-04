@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 #define MAX_GROUPS_DEFAULT 32
 #define NAME_LEN 32
@@ -57,14 +58,13 @@ static int sock_ctrl = -1;          // socket UDP de contrôle (clients ↔ serv
 static ServerConf gconf;
 
 static void on_sigint(int s){ (void)s; running = 0; }
+
 static void on_sigchld(int s){
     (void)s;
-    // reap non bloquant
     for(;;){
         int status;
         pid_t p = waitpid(-1, &status, WNOHANG);
         if(p<=0) break;
-        // libérer le slot
         for(unsigned i=0;i<GMAX;i++){
             if(groups[i].used && groups[i].pid == p){
                 fprintf(stderr, "[Serveur] Groupe '%s' (port %u) termine.\n",
@@ -160,14 +160,10 @@ int main(int argc, char **argv){
     }
     if(load_server_conf(argv[1], &gconf)<0) die_perror("server conf");
 
-    // install signals
-    struct sigaction sa; memset(&sa,0,sizeof sa);
-    sa.sa_handler = on_sigint; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM,&sa, NULL);
-    struct sigaction sc; memset(&sc,0,sizeof sc);
-    sc.sa_handler = on_sigchld; sigemptyset(&sc.sa_mask); sc.sa_flags = SA_RESTART|SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sc, NULL);
+    /* handlers portables (signal()) */
+    signal(SIGINT,  on_sigint);
+    signal(SIGTERM, on_sigint);
+    signal(SIGCHLD, on_sigchld);
 
     // state
     GMAX = gconf.max_groups;
@@ -248,7 +244,7 @@ int main(int argc, char **argv){
             groups[freei].port = port;
             strncpy(groups[freei].name, gname, NAME_LEN-1);
 
-            // addr d'admin -> 127.0.0.1:port (le groupe écoute localement)
+            // addr d'admin -> 127.0.0.1:port (le groupe écoute localement sur le serveur)
             memset(&groups[freei].addr,0,sizeof groups[freei].addr);
             groups[freei].addr.sin_family = AF_INET;
             groups[freei].addr.sin_port   = htons(port);
@@ -286,7 +282,7 @@ int main(int argc, char **argv){
             kill(groups[i].pid, SIGINT);
         }
     }
-    // attendre un peu
+    // attendre la fin des enfants
     for(unsigned i=0;i<GMAX;i++){
         if(groups[i].used){
             int st; waitpid(groups[i].pid, &st, 0);
