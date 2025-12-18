@@ -4,6 +4,8 @@
 #include <signal.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
 
 #define MAX_GROUPS_DEFAULT 32
 #define NAME_LEN 32
@@ -57,7 +59,54 @@ static unsigned GMAX = 0;
 static int sock_ctrl = -1;          // socket UDP de contrôle (clients ↔ serveur)
 static ServerConf gconf;
 
-static void on_sigint(int s){ (void)s; running = 0; }
+/* pour join propre du thread admin */
+static pthread_t th_in;
+static int th_in_started = 0;
+
+static void print_admin_help(void){
+    fprintf(stderr,
+        "\n"
+        "==================== ServeurISY — Commandes admin ====================\n"
+        "Tape ces commandes dans le terminal du serveur :\n"
+        "\n"
+        "  /list\n"
+        "     Affiche la liste des groupes actuellement actifs (nom, port, pid).\n"
+        "\n"
+        "  /banner <texte>\n"
+        "     Affiche une bannière 'collante' chez tous les clients de tous les groupes.\n"
+        "     (Les clients ne peuvent pas la fermer eux-mêmes.)\n"
+        "\n"
+        "  /banner_clr\n"
+        "     Supprime la bannière admin sur tous les groupes.\n"
+        "\n"
+        "  /sys <texte>\n"
+        "     Envoie un message système à tous les groupes (non collant).\n"
+        "\n"
+        "  /quit\n"
+        "     Arrête le serveur proprement (équivalent à Ctrl+C).\n"
+        "======================================================================\n"
+        "\n"
+    );
+}
+
+static void request_shutdown(void){
+    running = 0;
+
+    /* 1) casser fgets() */
+    fclose(stdin);
+
+    /* 2) casser recvfrom() */
+    if(sock_ctrl >= 0){
+        shutdown(sock_ctrl, SHUT_RDWR);
+        close(sock_ctrl);
+        sock_ctrl = -1;
+    }
+}
+
+static void on_sigint(int s){
+    (void)s;
+    request_shutdown();
+}
 
 static void on_sigchld(int s){
     (void)s;
@@ -66,7 +115,7 @@ static void on_sigchld(int s){
         pid_t p = waitpid(-1, &status, WNOHANG);
         if(p<=0) break;
         for(unsigned i=0;i<GMAX;i++){
-            if(groups[i].used && groups[i].pid == p){
+            if(groups && groups[i].used && groups[i].pid == p){
                 fprintf(stderr, "[Serveur] Groupe '%s' (port %u) termine.\n",
                         groups[i].name, (unsigned)groups[i].port);
                 groups[i].used = 0;
@@ -103,26 +152,25 @@ static int spawn_group(const char *name, uint16_t port, unsigned idle_sec, pid_t
 }
 
 static void broadcast_to_groups(const char *payload){
+    if(sock_ctrl < 0) return;
     for(unsigned i=0;i<GMAX;i++){
         if(!groups[i].used) continue;
-        sendto(sock_ctrl, payload, strlen(payload), 0,
-               (struct sockaddr*)&groups[i].addr, sizeof groups[i].addr);
+        (void)sendto(sock_ctrl, payload, strlen(payload), 0,
+                     (struct sockaddr*)&groups[i].addr, sizeof groups[i].addr);
     }
 }
 
-/* ───────── Thread input admin ─────────
-   Commandes console:
-     /banner <texte>     -> CTRL BANNER_SET à tous les groupes
-     /banner_clr         -> CTRL BANNER_CLR
-     /sys <texte>        -> SYS <texte> à tous les groupes
-     /list               -> affiche la table groupes
-     /quit               -> arrêt du serveur (Ctrl-C pareil)
-*/
+/* ───────── Thread input admin ───────── */
 static void *admin_input_thread(void *arg){
     (void)arg;
     char line[1024];
-    while(running && fgets(line,sizeof line, stdin)){
+
+    while(running){
+        if(!fgets(line,sizeof line, stdin)) break;
+        if(!running) break;
+
         trimnl(line);
+
         if(!strncmp(line,"/banner ",8)){
             char out[1100]; snprintf(out,sizeof out,"CTRL BANNER_SET %s", line+8);
             broadcast_to_groups(out);
@@ -142,11 +190,13 @@ static void *admin_input_thread(void *arg){
                             groups[i].name, (unsigned)groups[i].port, (int)groups[i].pid);
                 }
             }
+        }else if(!strcmp(line,"/help")){
+            print_admin_help();
         }else if(!strcmp(line,"/quit")){
-            running = 0;
+            request_shutdown();
             break;
         }else if(line[0]){
-            fprintf(stderr,"[Serveur] Commandes: /banner <txt> | /banner_clr | /sys <txt> | /list | /quit\n");
+            fprintf(stderr,"[Serveur] Commande inconnue. Tape /help.\n");
         }
     }
     return NULL;
@@ -160,10 +210,21 @@ int main(int argc, char **argv){
     }
     if(load_server_conf(argv[1], &gconf)<0) die_perror("server conf");
 
-    /* handlers portables (signal()) */
-    signal(SIGINT,  on_sigint);
-    signal(SIGTERM, on_sigint);
-    signal(SIGCHLD, on_sigchld);
+    /* handlers POSIX (sans SA_RESTART) */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    struct sigaction sc;
+    memset(&sc, 0, sizeof sc);
+    sc.sa_handler = on_sigchld;
+    sigemptyset(&sc.sa_mask);
+    sc.sa_flags = 0;
+    sigaction(SIGCHLD, &sc, NULL);
 
     // state
     GMAX = gconf.max_groups;
@@ -183,21 +244,29 @@ int main(int argc, char **argv){
     else if(inet_pton(AF_INET, gconf.bind_ip, &srv.sin_addr)!=1) die_perror("inet_pton bind");
     if(bind(sock_ctrl, (struct sockaddr*)&srv, sizeof srv)<0) die_perror("bind server");
 
-    // thread input admin
-    pthread_t th_in; pthread_create(&th_in, NULL, admin_input_thread, NULL);
-
     fprintf(stderr,"[Serveur] écoute UDP %s:%u  | groupes %u..%u  | idle=%us\n",
             gconf.bind_ip, (unsigned)gconf.server_port,
             (unsigned)gconf.base_port, (unsigned)(gconf.base_port+GMAX-1),
             gconf.idle_timeout);
 
+    /* Afficher l'aide une fois au démarrage */
+    print_admin_help();
+
+    // thread input admin
+    if(pthread_create(&th_in, NULL, admin_input_thread, NULL) == 0){
+        th_in_started = 1;
+    }
+
     // boucle contrôle
     char buf[1024];
     while(running){
         struct sockaddr_in cli; socklen_t cl=sizeof cli;
+
         ssize_t n = recvfrom(sock_ctrl, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
         if(n<0){
             if(errno==EINTR) continue;
+            if(!running) break;
+            if(errno == EBADF || errno == ENOTSOCK) break;
             die_perror("recvfrom");
         }
         buf[n]='\0';
@@ -213,7 +282,7 @@ int main(int argc, char **argv){
                 }
             }
             if(out[0]=='\0') strcpy(out,"(aucun)\n");
-            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+            if(sock_ctrl >= 0) sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
 
         }else if(!strncmp(buf,"CREATE ",7)){
             char gname[NAME_LEN]={0};
@@ -223,20 +292,20 @@ int main(int argc, char **argv){
             if(idx>=0){
                 char out[128];
                 snprintf(out,sizeof out,"OK %s %u", groups[idx].name, (unsigned)groups[idx].port);
-                sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+                if(sock_ctrl >= 0) sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
             int freei = find_free_slot();
             if(freei<0){
                 const char *err = "ERR no_slot";
-                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                if(sock_ctrl >= 0) sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
             uint16_t port = gconf.base_port + (uint16_t)freei;
             pid_t pid;
             if(spawn_group(gname, port, gconf.idle_timeout, &pid)<0){
                 const char *err = "ERR spawn";
-                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                if(sock_ctrl >= 0) sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
             groups[freei].used = 1;
@@ -244,7 +313,7 @@ int main(int argc, char **argv){
             groups[freei].port = port;
             strncpy(groups[freei].name, gname, NAME_LEN-1);
 
-            // addr d'admin -> 127.0.0.1:port (le groupe écoute localement sur le serveur)
+            // addr d'admin -> 127.0.0.1:port
             memset(&groups[freei].addr,0,sizeof groups[freei].addr);
             groups[freei].addr.sin_family = AF_INET;
             groups[freei].addr.sin_port   = htons(port);
@@ -252,26 +321,25 @@ int main(int argc, char **argv){
 
             char out[128];
             snprintf(out,sizeof out,"OK %s %u", gname, (unsigned)port);
-            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+            if(sock_ctrl >= 0) sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
 
         }else if(!strncmp(buf,"JOIN ",5)){
             char gname[NAME_LEN]={0}, user[EME_LEN]={0}, cip[64]={0};
             unsigned cport=0;
-            // On ignore cip/cport (le GroupeISY prend l'adresse depuis recvfrom)
             if(sscanf(buf+5,"%31s %19s %63s %u", gname, user, cip, &cport) < 2) continue;
 
             int idx = find_group_by_name(gname);
             if(idx<0){
                 const char *err="ERR notfound";
-                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                if(sock_ctrl >= 0) sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
             char out[128];
             snprintf(out,sizeof out,"OK %s %u", groups[idx].name, (unsigned)groups[idx].port);
-            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+            if(sock_ctrl >= 0) sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
 
         }else{
-            // commande inconnue -> ignore
+            // ignore
         }
     }
 
@@ -282,14 +350,17 @@ int main(int argc, char **argv){
             kill(groups[i].pid, SIGINT);
         }
     }
-    // attendre la fin des enfants
     for(unsigned i=0;i<GMAX;i++){
         if(groups[i].used){
             int st; waitpid(groups[i].pid, &st, 0);
         }
     }
 
-    if(sock_ctrl>=0) close(sock_ctrl);
+    if(th_in_started){
+        pthread_join(th_in, NULL);
+    }
+    if(sock_ctrl >= 0) close(sock_ctrl);
+
     free(groups);
     return 0;
 }
