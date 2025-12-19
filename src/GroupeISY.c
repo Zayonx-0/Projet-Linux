@@ -136,27 +136,24 @@ static void broadcast_to_all_nolock(int s, const char *payload){
     }
 }
 
-static void broadcast_sys_nolock(int s, const char *text){
-    char out[TXT_LEN + 96];
-    snprintf(out, sizeof out, "GROUPE[%s]: Message de [SERVER] : %s", gname_local, text);
+static void broadcast_group_line_nolock(int s, const char *line){
+    // normalise le format "ligne de chat"
+    char out[TXT_LEN + 128];
+    snprintf(out, sizeof out, "GROUPE[%s]: %s", gname_local, line);
     broadcast_to_all_nolock(s, out);
 }
 
 /* ───────── Admin token logic ─────────
-   IMPORTANT:
-   - Si le token admin est vide, on autorise une "initialisation" sur la 1ère commande admin reçue
-     (BAN/UNBAN) et on fixe g_admin_token = tok.
-   - Si le serveur envoie plus tard CTRL SETTOKEN <tok>, ça overwrites (pratique).
+   - Le serveur envoie normalement CTRL SETTOKEN <tok> à la création.
+   - Fallback: si token encore vide, la 1ère commande admin reçue initialise g_admin_token.
 */
 static int ensure_or_check_admin_token_locked(const char *tok){
     if(!tok || !*tok) return 0;
 
     if(g_admin_token[0] == '\0'){
-        // 1ère initialisation
         isy_strcpy(g_admin_token, sizeof g_admin_token, tok);
         return 1;
     }
-
     return (strcmp(g_admin_token, tok) == 0);
 }
 
@@ -186,7 +183,6 @@ static void *idle_timer_thread(void *arg){
         pthread_mutex_lock(&mtx);
         since = now - last_activity;
 
-        // warning when remaining <= 50% (simple)
         unsigned warn_threshold = (idle_timeout_sec >= 2 ? idle_timeout_sec / 2 : idle_timeout_sec);
 
         if(since >= (time_t)idle_timeout_sec){
@@ -279,7 +275,6 @@ int main(int argc, char **argv){
     fprintf(stderr, "[GroupeISY] '%s' UDP %u (idle=%us)\n",
             gname_local, (unsigned)gport_local, idle_timeout_sec);
 
-    // start idle timer thread
     pthread_t th_timer;
     TimerCtx tctx = {.sock = s};
     if(pthread_create(&th_timer, NULL, idle_timer_thread, &tctx) == 0){
@@ -299,7 +294,7 @@ int main(int argc, char **argv){
         }
         buf[n] = '\0';
 
-        /* Mark activity for MSG and CMD */
+        // activité
         if(!strncmp(buf, "MSG ", 4) || !strncmp(buf, "CMD ", 4)){
             pthread_mutex_lock(&mtx);
             last_activity = time(NULL);
@@ -346,8 +341,6 @@ int main(int argc, char **argv){
                 pthread_mutex_unlock(&mtx);
                 continue;
             }
-
-            // IMPORTANT: server can configure admin token
             if(!strncmp(buf, "CTRL SETTOKEN ", 14)){
                 const char *t = buf + 14;
                 pthread_mutex_lock(&mtx);
@@ -355,8 +348,6 @@ int main(int argc, char **argv){
                 pthread_mutex_unlock(&mtx);
                 continue;
             }
-
-            // Fusion: forward to clients then exit
             if(!strncmp(buf, "CTRL REDIRECT ", 14)){
                 pthread_mutex_lock(&mtx);
                 broadcast_to_all_nolock(s, buf);
@@ -366,7 +357,6 @@ int main(int argc, char **argv){
                 continue;
             }
 
-            // default: forward
             pthread_mutex_lock(&mtx);
             broadcast_to_all_nolock(s, buf);
             pthread_mutex_unlock(&mtx);
@@ -375,7 +365,71 @@ int main(int argc, char **argv){
 
         /* ── CMD … ──────────────────────────────────────────────── */
         if(!strncmp(buf, "CMD ", 4)){
-            // CMD BAN <token> <user>
+            // CMD BAN2 <token> <adminUser> <victim>
+            if(!strncmp(buf, "CMD BAN2 ", 9)){
+                char tok[ADMIN_TOKEN_LEN] = {0};
+                char adminu[EME_LEN] = {0};
+                char victim[EME_LEN] = {0};
+                if(sscanf(buf + 9, "%63s %19s %19s", tok, adminu, victim) != 3){
+                    send_txt(s, "ERR bad_args", &cli);
+                    continue;
+                }
+
+                pthread_mutex_lock(&mtx);
+                int ok = ensure_or_check_admin_token_locked(tok);
+                if(!ok){
+                    pthread_mutex_unlock(&mtx);
+                    send_txt(s, "ERR not_admin", &cli);
+                    continue;
+                }
+
+                ban_add_nolock(victim);
+                member_remove_nolock(victim);
+
+                char line[256];
+                snprintf(line, sizeof line, "[Action] (%s) a banni (%s)", adminu, victim);
+                broadcast_group_line_nolock(s, line);
+
+                pthread_mutex_unlock(&mtx);
+
+                send_txt(s, "OK banned", &cli);
+                continue;
+            }
+
+            // CMD UNBAN2 <token> <adminUser> <victim>
+            if(!strncmp(buf, "CMD UNBAN2 ", 11)){
+                char tok[ADMIN_TOKEN_LEN] = {0};
+                char adminu[EME_LEN] = {0};
+                char victim[EME_LEN] = {0};
+                if(sscanf(buf + 11, "%63s %19s %19s", tok, adminu, victim) != 3){
+                    send_txt(s, "ERR bad_args", &cli);
+                    continue;
+                }
+
+                pthread_mutex_lock(&mtx);
+                int ok = ensure_or_check_admin_token_locked(tok);
+                if(!ok){
+                    pthread_mutex_unlock(&mtx);
+                    send_txt(s, "ERR not_admin", &cli);
+                    continue;
+                }
+
+                int removed = ban_remove_nolock(victim);
+
+                if(removed){
+                    char line[256];
+                    snprintf(line, sizeof line, "[Action] (%s) a debanni (%s)", adminu, victim);
+                    broadcast_group_line_nolock(s, line);
+                    pthread_mutex_unlock(&mtx);
+                    send_txt(s, "OK unbanned", &cli);
+                } else {
+                    pthread_mutex_unlock(&mtx);
+                    send_txt(s, "OK not_banned", &cli);
+                }
+                continue;
+            }
+
+            // legacy: CMD BAN <token> <victim>
             if(!strncmp(buf, "CMD BAN ", 8)){
                 char tok[ADMIN_TOKEN_LEN] = {0};
                 char victim[EME_LEN] = {0};
@@ -394,17 +448,19 @@ int main(int argc, char **argv){
 
                 ban_add_nolock(victim);
                 member_remove_nolock(victim);
-                pthread_mutex_unlock(&mtx);
 
-                pthread_mutex_lock(&mtx);
-                broadcast_sys_nolock(s, "Moderation: un membre a ete banni.");
+                // pas d'adminUser en legacy -> message générique
+                char line[256];
+                snprintf(line, sizeof line, "[Action] (admin) a banni (%s)", victim);
+                broadcast_group_line_nolock(s, line);
+
                 pthread_mutex_unlock(&mtx);
 
                 send_txt(s, "OK banned", &cli);
                 continue;
             }
 
-            // CMD UNBAN <token> <user>
+            // legacy: CMD UNBAN <token> <victim>
             if(!strncmp(buf, "CMD UNBAN ", 10)){
                 char tok[ADMIN_TOKEN_LEN] = {0};
                 char victim[EME_LEN] = {0};
@@ -422,14 +478,14 @@ int main(int argc, char **argv){
                 }
 
                 int removed = ban_remove_nolock(victim);
-                pthread_mutex_unlock(&mtx);
-
                 if(removed){
-                    pthread_mutex_lock(&mtx);
-                    broadcast_sys_nolock(s, "Moderation: un membre a ete debanni.");
+                    char line[256];
+                    snprintf(line, sizeof line, "[Action] (admin) a debanni (%s)", victim);
+                    broadcast_group_line_nolock(s, line);
                     pthread_mutex_unlock(&mtx);
                     send_txt(s, "OK unbanned", &cli);
                 } else {
+                    pthread_mutex_unlock(&mtx);
                     send_txt(s, "OK not_banned", &cli);
                 }
                 continue;
@@ -452,7 +508,6 @@ int main(int argc, char **argv){
 
             pthread_mutex_lock(&mtx);
 
-            // refuse if banned
             if(ban_is_banned_nolock(user)){
                 pthread_mutex_unlock(&mtx);
                 send_txt(s, "SYS Vous etes banni de ce groupe.", &cli);
@@ -466,7 +521,7 @@ int main(int argc, char **argv){
                 continue;
             }
 
-            // on join: push active banners
+            // On join -> push banners
             if(!strcmp(text, "(joined)")){
                 if(admin_banner_active){
                     char ctrl[TXT_LEN + 32];
@@ -482,18 +537,18 @@ int main(int argc, char **argv){
 
             pthread_mutex_unlock(&mtx);
 
-            // if (left): remove
+            // left -> remove
             if(!strcmp(text, "(left)")){
                 pthread_mutex_lock(&mtx);
                 member_remove_nolock(user);
                 pthread_mutex_unlock(&mtx);
             }
 
-            char out[TXT_LEN + 96];
-            snprintf(out, sizeof out, "GROUPE[%s]: Message de %s : %s", gname_local, user, text);
+            char line[TXT_LEN + 96];
+            snprintf(line, sizeof line, "Message de %s : %s", user, text);
 
             pthread_mutex_lock(&mtx);
-            broadcast_to_all_nolock(s, out);
+            broadcast_group_line_nolock(s, line);
             pthread_mutex_unlock(&mtx);
 
             continue;
@@ -504,7 +559,9 @@ int main(int argc, char **argv){
             const char *text = buf + 4;
             if(*text){
                 pthread_mutex_lock(&mtx);
-                broadcast_sys_nolock(s, text);
+                char line[TXT_LEN + 96];
+                snprintf(line, sizeof line, "Message de [SERVER] : %s", text);
+                broadcast_group_line_nolock(s, line);
                 pthread_mutex_unlock(&mtx);
             }
             continue;

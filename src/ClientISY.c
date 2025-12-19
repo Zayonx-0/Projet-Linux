@@ -1,15 +1,15 @@
 // src/ClientISY.c
 #include "Commun.h"
-#include <sys/stat.h>
-#include <limits.h>
-#include <signal.h>
-#include <sys/ioctl.h>
-#include <sys/select.h>
+
+#include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_TOKENS 64
-#define MAX_LOG_LINES 200
-#define MAX_LINE 768
 
 typedef struct {
     char group[32];
@@ -34,131 +34,135 @@ typedef struct {
     // tokens (admin rights)
     TokenEntry tokens[MAX_TOKENS];
 
-    // UI state
-    char admin_banner[TXT_LEN];
-    int  admin_banner_active;
-    char idle_banner[TXT_LEN];
-    int  idle_banner_active;
-
-    // message log
-    char log[MAX_LOG_LINES][MAX_LINE];
-    int  log_count;
+    // UI pipe fds
+    int ui_in_fd;   // Client -> Affichage (write)
+    int ui_out_fd;  // Affichage -> Client (read)
+    pid_t ui_pid;
+    char fifo_in[256];
+    char fifo_out[256];
 
     // flags from rx thread
-    volatile int ui_dirty;
     volatile int redirect_pending;
     char redirect_group[32];
     uint16_t redirect_port;
     char redirect_reason[128];
 
-    volatile int group_deleted; // group says it's deleted due inactivity
+    volatile int group_deleted; // group says it's deleted
     volatile int stop_rx;
 
     pthread_t rx_th;
     pthread_mutex_t mtx;
 } ClientCtx;
 
-/* ───────────────────────── Utils ───────────────────────── */
+static volatile sig_atomic_t g_running = 1;
 
-static void add_log(ClientCtx *c, const char *line){
-    pthread_mutex_lock(&c->mtx);
-    if(c->log_count < MAX_LOG_LINES){
-        isy_strcpy(c->log[c->log_count], sizeof c->log[c->log_count], line);
-        c->log_count++;
-    } else {
-        for(int i=1;i<MAX_LOG_LINES;i++){
-            strcpy(c->log[i-1], c->log[i]);
-        }
-        isy_strcpy(c->log[MAX_LOG_LINES-1], sizeof c->log[MAX_LOG_LINES-1], line);
-    }
-    c->ui_dirty = 1;
-    pthread_mutex_unlock(&c->mtx);
-}
+/* ───────────────────────── UI helpers (FIFO protocol) ───────────────────────── */
 
-static int term_width(void){
-    struct winsize ws;
-    if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0){
-        if(ws.ws_col > 10) return (int)ws.ws_col;
-    }
-    return 80;
-}
-
-static void wrap_print(const char *s, int width){
-    if(width < 20) width = 20;
-    int col = 0;
-    for(const char *p=s; *p; p++){
-        putchar(*p);
-        col++;
-        if(*p=='\n'){ col=0; continue; }
-        if(col >= width){
-            putchar('\n');
-            col=0;
-        }
-    }
-    if(col) putchar('\n');
-}
-
-static void redraw(ClientCtx *c, int show_prompt){
-    pthread_mutex_lock(&c->mtx);
-
-    printf("\033[2J\033[H");
-
-    int w = term_width();
-
-    if(c->admin_banner_active){
-        printf("=== BANNIERE ADMIN (SERVEUR) ===\n");
-        wrap_print(c->admin_banner, w);
-        printf("\n");
-    }
-    if(c->idle_banner_active){
-        printf("=== BANNIERE INACTIVITE ===\n");
-        wrap_print(c->idle_banner, w);
-        printf("\n");
-    }
-
-    if(c->joined){
-        printf("=== GROUPE: %s | USER: %s ===\n\n", c->current_group, c->user);
+static void ui_send(ClientCtx *c, const char *fmt, ...){
+    if(c->ui_in_fd < 0) return;
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    size_t L = strlen(buf);
+    if(L == 0) return;
+    if(buf[L-1] != '\n'){
+        dprintf(c->ui_in_fd, "%s\n", buf);
     }else{
-        printf("=== PAS DANS UN GROUPE | USER: %s ===\n\n", c->user);
+        dprintf(c->ui_in_fd, "%s", buf);
     }
-
-    for(int i=0;i<c->log_count;i++){
-        puts(c->log[i]);
-    }
-
-    if(show_prompt && c->joined){
-        printf("\nMessage [%s] : ", c->current_group);
-        fflush(stdout);
-    }
-
-    c->ui_dirty = 0;
-    pthread_mutex_unlock(&c->mtx);
 }
 
-/* ───────────────────────── Help / Admin output (FIX UI) ─────────────────────────
-   IMPORTANT: on n'imprime plus avec puts/printf, sinon redraw efface tout.
-   On injecte dans le log.
-*/
+static void ui_set_header(ClientCtx *c){
+    pthread_mutex_lock(&c->mtx);
+    int joined = c->joined;
+    char user[EME_LEN]; isy_strcpy(user, sizeof user, c->user);
+    char grp[32]; grp[0] = '\0';
+    if(c->joined) isy_strcpy(grp, sizeof grp, c->current_group);
+    pthread_mutex_unlock(&c->mtx);
 
-static void ui_help_to_log(ClientCtx *c){
-    add_log(c, "=== AIDE CLIENTISY (admin / fusion / moderation) ===");
-    add_log(c, "Devenir ADMIN (gestionnaire) :");
-    add_log(c, "  - Cree le groupe via option 0 (Creation de groupe).");
-    add_log(c, "  - Le client envoie: CREATE <groupe> <tonPseudo>");
-    add_log(c, "  - Si le serveur renvoie un token, il est enregistre automatiquement.");
-    add_log(c, "Commandes en mode 'cmd' (dans dialogue) :");
-    add_log(c, "  help                         -> affiche cette aide");
-    add_log(c, "  admin                        -> liste les tokens admin");
-    add_log(c, "  settoken <groupe> <token>     -> importe un token manuellement");
-    add_log(c, "  ban <pseudo>                  -> bannit un membre (kick + empeche de revenir)");
-    add_log(c, "  unban <pseudo>                -> retire le ban");
-    add_log(c, "  merge <A> <B>                 -> fusionne B vers A (admin des 2 requis)");
-    add_log(c, "  msg                          -> retour a l'envoi de messages");
-    add_log(c, "  quit                         -> retour au menu principal");
-    add_log(c, "Notes:");
-    add_log(c, "  - ban/unban: il faut etre admin du groupe courant (token present).");
-    add_log(c, "  - merge A B: il faut etre admin de A et de B (deux tokens).");
-    add_log(c, "====================================================");
+    ui_send(c, "UI HEADER %d %s %s", joined, user, grp[0]?grp:"-");
+}
+
+static void ui_log(ClientCtx *c, const char *fmt, ...){
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    ui_send(c, "UI LOG %s", buf);
+}
+
+static void ui_help(ClientCtx *c){
+    ui_log(c, "=== AIDE CLIENTISY (admin / fusion / moderation) ===");
+    ui_log(c, "Devenir ADMIN : cree le groupe via option 0. Si le serveur renvoie un token, il est enregistre.");
+    ui_log(c, "Mode dialogue: tape 'cmd' pour entrer en mode commandes, 'msg' pour revenir aux messages.");
+    ui_log(c, "Commandes (mode cmd) :");
+    ui_log(c, "  help                         -> affiche cette aide");
+    ui_log(c, "  admin                        -> liste les tokens");
+    ui_log(c, "  settoken <groupe> <token>     -> enregistre un token manuellement");
+    ui_log(c, "  ban <pseudo>                  -> bannit un membre (kick + interdit de revenir)");
+    ui_log(c, "  unban <pseudo>                -> retire le ban");
+    ui_log(c, "  merge <A> <B>                 -> fusionne B vers A (tokens admin des 2 groupes requis)");
+    ui_log(c, "  msg                          -> retour au mode messages");
+    ui_log(c, "  quit                         -> retour au menu principal");
+    ui_log(c, "====================================================");
+}
+
+static void ui_menu(ClientCtx *c){
+    ui_log(c, "Choix des commandes :");
+    ui_log(c, "0 Creation de groupe");
+    ui_log(c, "1 Rejoindre un groupe");
+    ui_log(c, "2 Lister les groupes");
+    ui_log(c, "3 Dialoguer sur un groupe");
+    ui_log(c, "4 Quitter");
+    ui_log(c, "5 Quitter le groupe");
+    ui_log(c, "Entrez votre choix :");
+}
+
+/* lecture ligne depuis AffichageISY -> ClientISY */
+static int ui_readline(ClientCtx *c, char *out, size_t outsz){
+    if(c->ui_out_fd < 0) return 0;
+
+    static char buf[4096];
+    static size_t len = 0;
+
+    for(;;){
+        for(size_t i=0;i<len;i++){
+            if(buf[i] == '\n'){
+                size_t L = (i < outsz-1) ? i : outsz-1;
+                memcpy(out, buf, L);
+                out[L] = '\0';
+                memmove(buf, buf+i+1, len-(i+1));
+                len -= (i+1);
+                trimnl(out);
+                return 1;
+            }
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(c->ui_out_fd, &rfds);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 300000;
+
+        int r = select(c->ui_out_fd+1, &rfds, NULL, NULL, &tv);
+        if(r < 0){
+            if(errno == EINTR) continue;
+            return 0;
+        }
+        if(r == 0){
+            if(!g_running) return 0;
+            continue;
+        }
+
+        if(FD_ISSET(c->ui_out_fd, &rfds)){
+            ssize_t n = read(c->ui_out_fd, buf+len, sizeof(buf)-len);
+            if(n <= 0) return 0;
+            len += (size_t)n;
+            if(len >= sizeof(buf)) len = 0;
+        }
+    }
 }
 
 /* ───────────────────────── Tokens admin ───────────────────────── */
@@ -186,7 +190,6 @@ static void token_set(ClientCtx *c, const char *group, const char *token){
     if(e){
         isy_strcpy(e->token, sizeof e->token, token);
     }
-    c->ui_dirty = 1;
     pthread_mutex_unlock(&c->mtx);
 }
 
@@ -195,19 +198,49 @@ static const char* token_get(ClientCtx *c, const char *group){
     return e ? e->token : NULL;
 }
 
-static void token_print_to_log(ClientCtx *c){
-    add_log(c, "=== TOKENS ADMIN ENREGISTRES ===");
+static void token_print(ClientCtx *c){
+    ui_log(c, "=== TOKENS ADMIN ENREGISTRES ===");
     int any = 0;
     for(int i=0;i<MAX_TOKENS;i++){
         if(c->tokens[i].has){
-            char tmp[256];
-            snprintf(tmp, sizeof tmp, "  - %s : %s", c->tokens[i].group, c->tokens[i].token);
-            add_log(c, tmp);
+            ui_log(c, "  - %s : %s", c->tokens[i].group, c->tokens[i].token);
             any = 1;
         }
     }
-    if(!any) add_log(c, "  (aucun token)");
-    add_log(c, "===============================");
+    if(!any) ui_log(c, "  (aucun token)");
+    ui_log(c, "===============================");
+}
+
+/* ───────────────────────── Group join/leave ───────────────────────── */
+
+static void group_send_join_hello(ClientCtx *c){
+    char hello[128];
+    pthread_mutex_lock(&c->mtx);
+    snprintf(hello, sizeof hello, "MSG %s %s", c->user, "(joined)");
+    pthread_mutex_unlock(&c->mtx);
+    (void)sendto(c->sock_rx, hello, strlen(hello), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+}
+
+static void group_send_left(ClientCtx *c){
+    char bye[128];
+    pthread_mutex_lock(&c->mtx);
+    snprintf(bye, sizeof bye, "MSG %s %s", c->user, "(left)");
+    pthread_mutex_unlock(&c->mtx);
+    (void)sendto(c->sock_rx, bye, strlen(bye), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+}
+
+static void cleanup_joined_state(ClientCtx *c){
+    pthread_mutex_lock(&c->mtx);
+    c->joined = 0;
+    c->current_group[0] = '\0';
+    c->redirect_pending = 0;
+    c->group_deleted = 0;
+    pthread_mutex_unlock(&c->mtx);
+
+    ui_send(c, "UI BANNER_ADMIN_CLR");
+    ui_send(c, "UI BANNER_IDLE_CLR");
+    ui_send(c, "UI CLRLOG");
+    ui_set_header(c);
 }
 
 /* ───────────────────────── Server helpers ───────────────────────── */
@@ -238,34 +271,6 @@ static int server_list_and_find(ClientCtx *c, const char *gname, uint16_t *out_p
     return 0;
 }
 
-/* ───────────────────────── Group join/leave ───────────────────────── */
-
-static void group_send_join_hello(ClientCtx *c){
-    char hello[128];
-    snprintf(hello, sizeof hello, "MSG %s %s", c->user, "(joined)");
-    (void)sendto(c->sock_rx, hello, strlen(hello), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
-}
-
-static void group_send_left(ClientCtx *c){
-    char bye[128];
-    snprintf(bye, sizeof bye, "MSG %s %s", c->user, "(left)");
-    (void)sendto(c->sock_rx, bye, strlen(bye), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
-}
-
-static void cleanup_joined_state(ClientCtx *c){
-    pthread_mutex_lock(&c->mtx);
-    c->joined = 0;
-    c->current_group[0] = '\0';
-    c->admin_banner_active = 0;
-    c->idle_banner_active = 0;
-    c->admin_banner[0] = '\0';
-    c->idle_banner[0] = '\0';
-    c->redirect_pending = 0;
-    c->group_deleted = 0;
-    c->ui_dirty = 1;
-    pthread_mutex_unlock(&c->mtx);
-}
-
 /* ───────────────────────── RX thread ───────────────────────── */
 
 static void *rx_thread(void *arg){
@@ -287,35 +292,19 @@ static void *rx_thread(void *arg){
 
         if(!strncmp(buf, "CTRL ", 5)){
             if(!strncmp(buf, "CTRL BANNER_SET ", 16)){
-                pthread_mutex_lock(&c->mtx);
-                isy_strcpy(c->admin_banner, sizeof c->admin_banner, buf + 16);
-                c->admin_banner_active = 1;
-                c->ui_dirty = 1;
-                pthread_mutex_unlock(&c->mtx);
+                ui_send(c, "UI BANNER_ADMIN_SET %s", buf + 16);
                 continue;
             }
             if(!strcmp(buf, "CTRL BANNER_CLR")){
-                pthread_mutex_lock(&c->mtx);
-                c->admin_banner_active = 0;
-                c->admin_banner[0] = '\0';
-                c->ui_dirty = 1;
-                pthread_mutex_unlock(&c->mtx);
+                ui_send(c, "UI BANNER_ADMIN_CLR");
                 continue;
             }
             if(!strncmp(buf, "CTRL IBANNER_SET ", 18)){
-                pthread_mutex_lock(&c->mtx);
-                isy_strcpy(c->idle_banner, sizeof c->idle_banner, buf + 18);
-                c->idle_banner_active = 1;
-                c->ui_dirty = 1;
-                pthread_mutex_unlock(&c->mtx);
+                ui_send(c, "UI BANNER_IDLE_SET %s", buf + 18);
                 continue;
             }
             if(!strcmp(buf, "CTRL IBANNER_CLR")){
-                pthread_mutex_lock(&c->mtx);
-                c->idle_banner_active = 0;
-                c->idle_banner[0] = '\0';
-                c->ui_dirty = 1;
-                pthread_mutex_unlock(&c->mtx);
+                ui_send(c, "UI BANNER_IDLE_CLR");
                 continue;
             }
             if(!strncmp(buf, "CTRL REDIRECT ", 14)){
@@ -340,44 +329,73 @@ static void *rx_thread(void *arg){
                 isy_strcpy(c->redirect_group, sizeof c->redirect_group, ng);
                 c->redirect_port = (uint16_t)p;
                 isy_strcpy(c->redirect_reason, sizeof c->redirect_reason, reason[0]?reason:"redirect");
-                c->ui_dirty = 1;
                 pthread_mutex_unlock(&c->mtx);
 
-                add_log(c, "SYS: fusion/redirect demande par le serveur… bascule automatique imminente.");
+                ui_log(c, "SYS: fusion/redirect demande par le serveur… bascule automatique.");
                 continue;
             }
 
-            add_log(c, buf);
+            ui_log(c, "%s", buf);
             continue;
         }
 
         if(!strncmp(buf, "SYS Le groupe est supprime", 26) || strstr(buf, "Le groupe est supprime")){
             pthread_mutex_lock(&c->mtx);
             c->group_deleted = 1;
-            c->ui_dirty = 1;
             pthread_mutex_unlock(&c->mtx);
         }
 
-        add_log(c, buf);
+        ui_log(c, "%s", buf);
     }
     return NULL;
 }
 
-/* ───────────────────────── Menu ───────────────────────── */
+/* ───────────────────────── UI process spawn ───────────────────────── */
 
-static void menu(void){
-    puts("Choix des commandes :");
-    puts("0 Creation de groupe");
-    puts("1 Rejoindre un groupe");
-    puts("2 Lister les groupes");
-    puts("3 Dialoguer sur un groupe");
-    puts("4 Quitter");
-    puts("5 Quitter le groupe");
+static int start_ui(ClientCtx *c){
+    snprintf(c->fifo_in,  sizeof c->fifo_in,  "/tmp/isy_ui_in_%d",  (int)getpid());
+    snprintf(c->fifo_out, sizeof c->fifo_out, "/tmp/isy_ui_out_%d", (int)getpid());
+
+    unlink(c->fifo_in);
+    unlink(c->fifo_out);
+
+    if(mkfifo(c->fifo_in, 0600) < 0) return -1;
+    if(mkfifo(c->fifo_out, 0600) < 0) return -1;
+
+    pid_t p = fork();
+    if(p < 0) return -1;
+
+    if(p == 0){
+        execl("./AffichageISY", "AffichageISY", c->fifo_in, c->fifo_out, (char*)NULL);
+        _exit(127);
+    }
+
+    c->ui_pid = p;
+
+    c->ui_in_fd = open(c->fifo_in, O_RDWR);
+    if(c->ui_in_fd < 0) return -1;
+
+    c->ui_out_fd = open(c->fifo_out, O_RDWR);
+    if(c->ui_out_fd < 0) return -1;
+
+    ui_set_header(c);
+    ui_send(c, "UI CLRLOG");
+    ui_help(c);
+    return 0;
 }
 
-static void on_sig(int signo){
-    (void)signo;
-    _exit(0);
+static void stop_ui(ClientCtx *c){
+    if(c->ui_in_fd >= 0){
+        ui_send(c, "UI QUIT");
+        close(c->ui_in_fd);
+        c->ui_in_fd = -1;
+    }
+    if(c->ui_out_fd >= 0){
+        close(c->ui_out_fd);
+        c->ui_out_fd = -1;
+    }
+    if(c->fifo_in[0]) unlink(c->fifo_in);
+    if(c->fifo_out[0]) unlink(c->fifo_out);
 }
 
 /* ───────────────────────── Dialogue loop ───────────────────────── */
@@ -386,20 +404,22 @@ static void dialog_loop(ClientCtx *c){
     char line[512];
     int cmd_mode = 0;
 
-    pthread_mutex_lock(&c->mtx);
-    c->ui_dirty = 1;
-    pthread_mutex_unlock(&c->mtx);
+    ui_log(c, "Tapez quit pour revenir au menu, cmd pour entrer une commande, msg pour revenir aux messages.");
 
-    while(c->joined){
-        if(c->ui_dirty){
-            redraw(c, 1);
+    while(1){
+        pthread_mutex_lock(&c->mtx);
+        int joined = c->joined;
+        int deleted = c->group_deleted;
+        int redir = c->redirect_pending;
+        pthread_mutex_unlock(&c->mtx);
+
+        if(!joined) break;
+
+        if(deleted){
+            ui_log(c, "SYS: le groupe a ete supprime. Tapez quit pour revenir au menu.");
         }
 
-        if(c->group_deleted){
-            add_log(c, "SYS: le groupe a ete supprime. Tapez quit pour revenir au menu.");
-        }
-
-        if(c->redirect_pending){
+        if(redir){
             char ng[32]; uint16_t np; char rs[128];
             pthread_mutex_lock(&c->mtx);
             isy_strcpy(ng, sizeof ng, c->redirect_group);
@@ -409,46 +429,25 @@ static void dialog_loop(ClientCtx *c){
             pthread_mutex_unlock(&c->mtx);
 
             group_send_left(c);
-
-            char info[256];
-            snprintf(info, sizeof info, "SYS: redirect vers %s:%u (%s)", ng, (unsigned)np, rs);
-            add_log(c, info);
+            ui_log(c, "SYS: redirect vers %s:%u (%s)", ng, (unsigned)np, rs);
 
             c->grp_addr.sin_family = AF_INET;
             c->grp_addr.sin_port   = htons(np);
-            c->grp_addr.sin_addr = c->srv_addr.sin_addr;
+            c->grp_addr.sin_addr   = c->srv_addr.sin_addr;
 
             pthread_mutex_lock(&c->mtx);
             isy_strcpy(c->current_group, sizeof c->current_group, ng);
             c->joined = 1;
-            c->ui_dirty = 1;
             pthread_mutex_unlock(&c->mtx);
 
+            ui_set_header(c);
             group_send_join_hello(c);
             continue;
         }
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
-
-        int r = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
-        if(r < 0){
-            if(errno == EINTR) continue;
-            break;
-        }
-        if(r == 0){
-            continue;
-        }
-
-        if(!FD_ISSET(STDIN_FILENO, &rfds)) continue;
-        if(!fgets(line, sizeof line, stdin)) break;
+        if(!ui_readline(c, line, sizeof line)) break;
         trimnl(line);
-
-        if(line[0] == '\0'){
-            continue;
-        }
+        if(line[0] == '\0') continue;
 
         if(!strcmp(line, "quit")){
             break;
@@ -456,104 +455,123 @@ static void dialog_loop(ClientCtx *c){
 
         if(!strcmp(line, "cmd")){
             cmd_mode = 1;
-            add_log(c, "SYS: mode cmd actif. Tape 'help' pour les commandes, ou 'msg' pour revenir.");
+            ui_log(c, "SYS: mode cmd actif. Tape 'help' pour les commandes, ou 'msg' pour revenir.");
             continue;
         }
         if(!strcmp(line, "msg")){
             cmd_mode = 0;
-            add_log(c, "SYS: retour au mode messages.");
+            ui_log(c, "SYS: retour au mode messages.");
             continue;
         }
 
         if(cmd_mode){
             if(!strcmp(line, "help")){
-                ui_help_to_log(c);
+                ui_help(c);
                 continue;
             }
             if(!strcmp(line, "admin")){
-                token_print_to_log(c);
+                token_print(c);
                 continue;
             }
-
-            // NEW: import token manually
             if(!strncmp(line, "settoken ", 9)){
                 char g[32]={0}, tok[ADMIN_TOKEN_LEN]={0};
                 if(sscanf(line+9, "%31s %63s", g, tok) == 2){
                     token_set(c, g, tok);
-                    char msg[256];
-                    snprintf(msg, sizeof msg, "SYS: token enregistre pour %s.", g);
-                    add_log(c, msg);
+                    ui_log(c, "SYS: token enregistre pour %s.", g);
                 }else{
-                    add_log(c, "SYS: syntaxe: settoken <groupe> <token>");
+                    ui_log(c, "SYS: syntaxe: settoken <groupe> <token>");
                 }
                 continue;
             }
-
             if(!strncmp(line, "ban ", 4)){
                 const char *victim = line + 4;
                 const char *tok = token_get(c, c->current_group);
                 if(!tok){
-                    add_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
+                    ui_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
                     continue;
                 }
-                char out[256];
-                snprintf(out, sizeof out, "CMD BAN %s %s", tok, victim);
-                sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
-                add_log(c, "SYS: commande BAN envoyee.");
+                char out2[256];
+                snprintf(out2, sizeof out2, "CMD BAN2 %s %s %s", tok, c->user, victim);
+                sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+                ui_log(c, "SYS: commande BAN envoyee.");
                 continue;
             }
-
             if(!strncmp(line, "unban ", 6)){
                 const char *victim = line + 6;
                 const char *tok = token_get(c, c->current_group);
                 if(!tok){
-                    add_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
+                    ui_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
                     continue;
                 }
-                char out[256];
-                snprintf(out, sizeof out, "CMD UNBAN %s %s", tok, victim);
-                sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
-                add_log(c, "SYS: commande UNBAN envoyee.");
+                char out2[256];
+                snprintf(out2, sizeof out2, "CMD UNBAN2 %s %s %s", tok, c->user, victim);
+                sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+                ui_log(c, "SYS: commande UNBAN envoyee.");
                 continue;
             }
 
             if(!strncmp(line, "merge ", 6)){
                 char A[32]={0}, B[32]={0};
                 if(sscanf(line+6, "%31s %31s", A, B) != 2){
-                    add_log(c, "SYS: syntaxe: merge <A> <B>");
+                    ui_log(c, "SYS: syntaxe: merge <A> <B>");
                     continue;
                 }
+
                 const char *tA = token_get(c, A);
                 const char *tB = token_get(c, B);
                 if(!tA || !tB){
-                    add_log(c, "SYS: il faut etre admin des 2 groupes (tokens manquants).");
+                    ui_log(c, "SYS: il faut etre admin des 2 groupes (tokens manquants).");
                     continue;
                 }
+
                 char req[256];
                 snprintf(req, sizeof req, "MERGE %s %s %s %s %s", c->user, tA, A, tB, B);
                 sendto(c->sock_srv, req, strlen(req), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr);
 
+                // IMPORTANT: ne jamais bloquer ici -> sock_srv a un timeout
                 char resp[256];
                 struct sockaddr_in from; socklen_t fl = sizeof from;
                 ssize_t n = recvfrom(c->sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
+
                 if(n > 0){
                     resp[n] = '\0';
-                    add_log(c, resp);
+                    ui_log(c, "%s", resp);
                 } else {
-                    add_log(c, "SYS: merge envoye (pas de reponse immediate).");
+                    if(errno == EAGAIN || errno == EWOULDBLOCK){
+                        ui_log(c, "SYS: merge envoye (pas de reponse immediate).");
+                    } else if(errno == EINTR){
+                        ui_log(c, "SYS: merge interrompu.");
+                    } else {
+                        ui_log(c, "SYS: merge envoye (recv err: %s)", strerror(errno));
+                    }
                 }
                 continue;
             }
 
-            add_log(c, "SYS: commande inconnue. Tape 'help'.");
+            ui_log(c, "SYS: commande inconnue. Tape 'help'.");
             continue;
         }
 
-        {
-            char out[512];
-            snprintf(out, sizeof out, "MSG %s %s", c->user, line);
-            sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
-        }
+        // message mode
+        char out[512];
+        snprintf(out, sizeof out, "MSG %s %s", c->user, line);
+        sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+    }
+}
+
+/* ───────────────────────── Signals ───────────────────────── */
+
+static ClientCtx *g_ctx = NULL;
+
+static void on_sig(int s){
+    (void)s;
+    g_running = 0;
+    if(g_ctx){
+        pthread_mutex_lock(&g_ctx->mtx);
+        int joined = g_ctx->joined;
+        pthread_mutex_unlock(&g_ctx->mtx);
+        if(joined) group_send_left(g_ctx);
+        ui_send(g_ctx, "UI QUIT");
     }
 }
 
@@ -581,6 +599,7 @@ int main(int argc, char **argv){
 
     FILE *f = fopen(argv[1], "r");
     if(!f) die_perror("client conf");
+
     char line[256], k[64], v[128];
     while(fgets(line, sizeof line, f)){
         if(line[0]=='#' || strlen(line)<3) continue;
@@ -593,17 +612,26 @@ int main(int argc, char **argv){
     }
     fclose(f);
 
-    signal(SIGINT, on_sig);
-    signal(SIGTERM, on_sig);
-
     ClientCtx c;
     memset(&c, 0, sizeof c);
     pthread_mutex_init(&c.mtx, NULL);
 
+    c.ui_in_fd = -1;
+    c.ui_out_fd = -1;
+
     isy_strcpy(c.user, sizeof c.user, conf.user);
 
+    g_ctx = &c;
+    signal(SIGINT, on_sig);
+    signal(SIGTERM, on_sig);
+
+    // sockets
     c.sock_srv = socket(AF_INET, SOCK_DGRAM, 0);
     if(c.sock_srv < 0) die_perror("socket srv");
+
+    // >>> FIX IMPORTANT: timeout sur sock_srv pour éviter le freeze (merge / list / etc.)
+    struct timeval tvs; tvs.tv_sec = 0; tvs.tv_usec = 300000; // 300ms
+    setsockopt(c.sock_srv, SOL_SOCKET, SO_RCVTIMEO, &tvs, sizeof tvs);
 
     memset(&c.srv_addr, 0, sizeof c.srv_addr);
     c.srv_addr.sin_family = AF_INET;
@@ -619,20 +647,26 @@ int main(int argc, char **argv){
     laddr.sin_addr.s_addr = htonl(INADDR_ANY);
     if(bind(c.sock_rx, (struct sockaddr*)&laddr, sizeof laddr) < 0) die_perror("bind rx");
 
+    // start UI process
+    if(start_ui(&c) < 0){
+        perror("start_ui");
+        return 1;
+    }
+    ui_set_header(&c);
+
+    // start RX thread
     c.stop_rx = 0;
     if(pthread_create(&c.rx_th, NULL, rx_thread, &c) != 0) die_perror("pthread_create rx");
 
-    // Affiche l'aide une fois au démarrage dans le log (pas en stdout)
-    ui_help_to_log(&c);
+    // main menu loop (reads from UI)
+    char in[512];
 
-    for(;;){
-        menu();
-        printf("Choix : ");
-        fflush(stdout);
-        if(!fgets(line, sizeof line, stdin)) break;
-        trimnl(line);
+    while(g_running){
+        ui_menu(&c);
+        if(!ui_readline(&c, in, sizeof in)) break;
+        trimnl(in);
 
-        if(!strcmp(line, "2")){
+        if(!strcmp(in, "2")){
             const char *cmd = "LIST";
             sendto(c.sock_srv, cmd, strlen(cmd), 0, (struct sockaddr*)&c.srv_addr, sizeof c.srv_addr);
 
@@ -641,68 +675,86 @@ int main(int argc, char **argv){
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
             if(n > 0){
                 resp[n]='\0';
-                puts(resp);
+                char *save=NULL;
+                char *ln = strtok_r(resp, "\n", &save);
+                while(ln){
+                    ui_log(&c, "%s", ln);
+                    ln = strtok_r(NULL, "\n", &save);
+                }
             } else {
-                puts("(pas de reponse)");
+                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "(pas de reponse)");
+                else ui_log(&c, "(recv err: %s)", strerror(errno));
             }
             continue;
         }
 
-        if(!strcmp(line, "0")){
-            char gname[32];
-            printf("Saisire le nom du groupe\n");
-            if(!fgets(gname, sizeof gname, stdin)) continue;
-            trimnl(gname);
+        if(!strcmp(in, "0")){
+            ui_log(&c, "Saisire le nom du groupe :");
+            if(!ui_readline(&c, in, sizeof in)) break;
+            trimnl(in);
+            if(!in[0]) continue;
 
             char req[128];
-            snprintf(req, sizeof req, "CREATE %s %s", gname, c.user);
+            snprintf(req, sizeof req, "CREATE %s %s", in, c.user);
             sendto(c.sock_srv, req, strlen(req), 0, (struct sockaddr*)&c.srv_addr, sizeof c.srv_addr);
 
             char resp[256];
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
-            if(n <= 0){ puts("ERR: pas de reponse"); continue; }
+            if(n <= 0){
+                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "ERR: pas de reponse");
+                else ui_log(&c, "ERR: %s", strerror(errno));
+                continue;
+            }
             resp[n]='\0';
 
             char okg[32]={0}, tok[ADMIN_TOKEN_LEN]={0};
             unsigned p=0;
             int nb = sscanf(resp, "OK %31s %u %63s", okg, &p, tok);
-            puts(resp);
+
+            ui_log(&c, "%s", resp);
 
             if(nb == 3 && tok[0]){
                 token_set(&c, okg, tok);
-                char msg[256];
-                snprintf(msg, sizeof msg, "SYS: tu es ADMIN de %s. Token enregistre. (cmd -> admin)", okg);
-                add_log(&c, msg);
+                ui_log(&c, "SYS: tu es ADMIN de %s. Token enregistre. (cmd -> admin)", okg);
             } else {
-                add_log(&c, "SYS: aucun token recu -> pas admin.");
+                ui_log(&c, "SYS: aucun token recu -> pas admin.");
             }
             continue;
         }
 
-        if(!strcmp(line, "1")){
-            if(c.joined){
-                puts("Vous etes deja dans un groupe. Utilisez 5 pour quitter le groupe.");
+        if(!strcmp(in, "1")){
+            pthread_mutex_lock(&c.mtx);
+            int already = c.joined;
+            pthread_mutex_unlock(&c.mtx);
+
+            if(already){
+                ui_log(&c, "Vous etes deja dans un groupe. Utilisez 5 pour quitter le groupe.");
                 continue;
             }
-            char gname[32];
-            printf("Saisire le nom du groupe\n");
-            if(!fgets(gname, sizeof gname, stdin)) continue;
-            trimnl(gname);
+
+            ui_log(&c, "Saisire le nom du groupe :");
+            if(!ui_readline(&c, in, sizeof in)) break;
+            trimnl(in);
+            if(!in[0]) continue;
 
             char req[256];
-            snprintf(req, sizeof req, "JOIN %s %s 0.0.0.0 0", gname, c.user);
+            snprintf(req, sizeof req, "JOIN %s %s 0.0.0.0 0", in, c.user);
             sendto(c.sock_srv, req, strlen(req), 0, (struct sockaddr*)&c.srv_addr, sizeof c.srv_addr);
 
             char resp[256];
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
-            if(n <= 0){ puts("Join failed"); continue; }
+            if(n <= 0){
+                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "Join failed (pas de reponse)");
+                else ui_log(&c, "Join failed (%s)", strerror(errno));
+                continue;
+            }
             resp[n]='\0';
 
             unsigned p=0; char okg[32]={0};
             if(sscanf(resp, "OK %31s %u", okg, &p) != 2){
-                puts(resp);
+                ui_log(&c, "%s", resp);
                 continue;
             }
 
@@ -712,63 +764,84 @@ int main(int argc, char **argv){
             c.grp_addr.sin_family = AF_INET;
             c.grp_addr.sin_port = htons((uint16_t)p);
             c.grp_addr.sin_addr = c.srv_addr.sin_addr;
-            c.log_count = 0;
-            c.admin_banner_active = 0; c.idle_banner_active = 0;
-            c.admin_banner[0] = '\0'; c.idle_banner[0] = '\0';
             c.group_deleted = 0;
-            c.ui_dirty = 1;
             pthread_mutex_unlock(&c.mtx);
 
-            printf("Connexion au groupe %s realisee.\n", okg);
+            ui_send(&c, "UI CLRLOG");
+            ui_send(&c, "UI BANNER_ADMIN_CLR");
+            ui_send(&c, "UI BANNER_IDLE_CLR");
+            ui_set_header(&c);
 
+            ui_log(&c, "Connexion au groupe %s realisee.", okg);
             group_send_join_hello(&c);
             continue;
         }
 
-        if(!strcmp(line, "3")){
-            if(!c.joined){
-                puts("Rejoignez un groupe d'abord (option 1).");
+        if(!strcmp(in, "3")){
+            pthread_mutex_lock(&c.mtx);
+            int joined = c.joined;
+            char cg[32]; isy_strcpy(cg, sizeof cg, c.current_group);
+            pthread_mutex_unlock(&c.mtx);
+
+            if(!joined){
+                ui_log(&c, "Rejoignez un groupe d'abord (option 1).");
                 continue;
             }
+
             uint16_t dummy_port;
-            if(!server_list_and_find(&c, c.current_group, &dummy_port)){
-                puts("Le groupe n'existe plus (supprime). Etat reset.");
+            if(!server_list_and_find(&c, cg, &dummy_port)){
+                ui_log(&c, "Le groupe n'existe plus (supprime). Etat reset.");
                 cleanup_joined_state(&c);
                 continue;
             }
+
             dialog_loop(&c);
 
-            if(c.group_deleted){
+            pthread_mutex_lock(&c.mtx);
+            int deleted = c.group_deleted;
+            pthread_mutex_unlock(&c.mtx);
+
+            if(deleted){
                 cleanup_joined_state(&c);
             }
             continue;
         }
 
-        if(!strcmp(line, "5")){
-            if(!c.joined){
-                puts("Vous n'etes dans aucun groupe.");
+        if(!strcmp(in, "5")){
+            pthread_mutex_lock(&c.mtx);
+            int joined = c.joined;
+            pthread_mutex_unlock(&c.mtx);
+
+            if(!joined){
+                ui_log(&c, "Vous n'etes dans aucun groupe.");
                 continue;
             }
             group_send_left(&c);
             cleanup_joined_state(&c);
-            puts("Groupe quitte.");
+            ui_log(&c, "Groupe quitte.");
             continue;
         }
 
-        if(!strcmp(line, "4")){
+        if(!strcmp(in, "4")){
             break;
         }
 
-        puts("Commande inconnue.");
+        ui_log(&c, "Commande inconnue.");
     }
 
-    if(c.joined){
-        group_send_left(&c);
-    }
+    pthread_mutex_lock(&c.mtx);
+    int joined = c.joined;
+    pthread_mutex_unlock(&c.mtx);
+    if(joined) group_send_left(&c);
+
     c.stop_rx = 1;
     pthread_join(c.rx_th, NULL);
+
     close(c.sock_rx);
     close(c.sock_srv);
+
+    stop_ui(&c);
+
     pthread_mutex_destroy(&c.mtx);
     return 0;
 }

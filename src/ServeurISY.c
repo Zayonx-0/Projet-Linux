@@ -4,8 +4,6 @@
 #include <signal.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <errno.h>
 
 #define MAX_GROUPS_DEFAULT 32
 #define NAME_LEN 32
@@ -15,9 +13,8 @@ typedef struct {
     char name[NAME_LEN];
     uint16_t port;
     pid_t pid;
-    struct sockaddr_in addr;         // 127.0.0.1:port (admin vers GroupeISY local)
-    char owner[EME_LEN];             // user gestionnaire (créateur)
-    char token[ADMIN_TOKEN_LEN];     // token admin associé au groupe
+    struct sockaddr_in addr;            // 127.0.0.1:port (canal admin vers GroupeISY local)
+    char admin_token[ADMIN_TOKEN_LEN];  // token admin (gestionnaire) du groupe
 } GroupRec;
 
 /* ───────── Config serveur ───────── */
@@ -62,44 +59,9 @@ static int sock_ctrl = -1;
 static ServerConf gconf;
 
 static pthread_t th_in;
-static int th_in_started = 0;
 
-static void print_admin_help(void){
-    fprintf(stderr,
-        "\n"
-        "==================== ServeurISY — Commandes admin ====================\n"
-        "Tape ces commandes dans le terminal du serveur :\n"
-        "\n"
-        "  /list\n"
-        "     Affiche la liste des groupes actuellement actifs (nom, port, pid).\n"
-        "\n"
-        "  /banner <texte>\n"
-        "     Affiche une bannière 'collante' chez tous les clients de tous les groupes.\n"
-        "\n"
-        "  /banner_clr\n"
-        "     Supprime la bannière admin sur tous les groupes.\n"
-        "\n"
-        "  /sys <texte>\n"
-        "     Envoie un message système à tous les groupes (non collant).\n"
-        "\n"
-        "  /quit\n"
-        "     Arrête le serveur proprement (équivalent à Ctrl+C).\n"
-        "======================================================================\n"
-        "\n"
-    );
-}
-
-static void request_shutdown(void){
-    running = 0;
-    fclose(stdin);
-    if(sock_ctrl >= 0){
-        shutdown(sock_ctrl, SHUT_RDWR);
-        close(sock_ctrl);
-        sock_ctrl = -1;
-    }
-}
-
-static void on_sigint(int s){ (void)s; request_shutdown(); }
+/* ───────── Signaux ───────── */
+static void on_sigint(int s){ (void)s; running = 0; }
 
 static void on_sigchld(int s){
     (void)s;
@@ -108,19 +70,18 @@ static void on_sigchld(int s){
         pid_t p = waitpid(-1, &status, WNOHANG);
         if(p<=0) break;
         for(unsigned i=0;i<GMAX;i++){
-            if(groups && groups[i].used && groups[i].pid == p){
+            if(groups[i].used && groups[i].pid == p){
                 fprintf(stderr, "[Serveur] Groupe '%s' (port %u) termine.\n",
                         groups[i].name, (unsigned)groups[i].port);
                 groups[i].used = 0;
                 groups[i].pid = -1;
-                groups[i].owner[0] = '\0';
-                groups[i].token[0] = '\0';
+                groups[i].admin_token[0] = '\0';
             }
         }
     }
 }
 
-/* ───────── Helpers ───────── */
+/* ───────── Helpers groupes ───────── */
 static int find_group_by_name(const char *name){
     for(unsigned i=0;i<GMAX;i++){
         if(groups[i].used && !strcmp(groups[i].name, name)) return (int)i;
@@ -147,46 +108,55 @@ static int spawn_group(const char *name, uint16_t port, unsigned idle_sec, pid_t
 }
 
 static void broadcast_to_groups(const char *payload){
-    if(sock_ctrl < 0) return;
     for(unsigned i=0;i<GMAX;i++){
         if(!groups[i].used) continue;
-        (void)sendto(sock_ctrl, payload, strlen(payload), 0,
-                     (struct sockaddr*)&groups[i].addr, sizeof groups[i].addr);
+        sendto(sock_ctrl, payload, strlen(payload), 0,
+               (struct sockaddr*)&groups[i].addr, sizeof groups[i].addr);
     }
 }
 
+/* ───────── Token generator ───────── */
 static void gen_token(char out[ADMIN_TOKEN_LEN]){
-    static const char alnum[] =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    unsigned r = (unsigned)time(NULL) ^ (unsigned)getpid();
-    for(int i=0;i<ADMIN_TOKEN_LEN-1;i++){
-        r = 1103515245u * r + 12345u;
-        out[i] = alnum[r % (sizeof(alnum)-1)];
+    unsigned char rnd[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if(fd >= 0){
+        ssize_t n = read(fd, rnd, sizeof rnd);
+        close(fd);
+        if(n == (ssize_t)sizeof rnd){
+            static const char *hx="0123456789abcdef";
+            for(int i=0;i<16;i++){
+                out[i*2]   = hx[(rnd[i]>>4)&0xF];
+                out[i*2+1] = hx[(rnd[i])&0xF];
+            }
+            out[32] = '\0';
+            return;
+        }
     }
-    out[ADMIN_TOKEN_LEN-1] = '\0';
-}
-
-static int is_owner_token_ok(int idx, const char *user, const char *token){
-    if(idx < 0) return 0;
-    if(!groups[idx].used) return 0;
-    if(groups[idx].owner[0] == '\0') return 0;
-    if(strcmp(groups[idx].owner, user) != 0) return 0;
-    if(groups[idx].token[0] == '\0') return 0;
-    if(strcmp(groups[idx].token, token) != 0) return 0;
-    return 1;
+    unsigned long a = (unsigned long)time(NULL);
+    unsigned long b = (unsigned long)getpid();
+    snprintf(out, ADMIN_TOKEN_LEN, "%08lx%08lx", a, b);
 }
 
 /* ───────── Thread input admin ───────── */
 static void *admin_input_thread(void *arg){
     (void)arg;
+
+    // Permet l'annulation (pthread_cancel) pendant fgets()
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+    fprintf(stderr,
+        "[Serveur] Commandes admin:\n"
+        "  /banner <txt>     -> bannière serveur (tous les groupes)\n"
+        "  /banner_clr       -> retire bannière serveur\n"
+        "  /sys <txt>        -> message SYS (tous les groupes)\n"
+        "  /list             -> liste groupes actifs\n"
+        "  /quit             -> arrêter le serveur (Ctrl-C aussi)\n"
+    );
+
     char line[1024];
-
-    while(running){
-        if(!fgets(line,sizeof line, stdin)) break;
-        if(!running) break;
-
+    while(running && fgets(line,sizeof line, stdin)){
         trimnl(line);
-
         if(!strncmp(line,"/banner ",8)){
             char out[1100]; snprintf(out,sizeof out,"CTRL BANNER_SET %s", line+8);
             broadcast_to_groups(out);
@@ -202,18 +172,16 @@ static void *admin_input_thread(void *arg){
             fprintf(stderr,"[Serveur] Groupes actifs:\n");
             for(unsigned i=0;i<GMAX;i++){
                 if(groups[i].used){
-                    fprintf(stderr,"  - %s  %u  (pid=%d) owner=%s\n",
+                    fprintf(stderr,"  - %s  %u  (pid=%d) token=%s\n",
                             groups[i].name, (unsigned)groups[i].port, (int)groups[i].pid,
-                            groups[i].owner[0]?groups[i].owner:"(none)");
+                            groups[i].admin_token[0]?groups[i].admin_token:"(none)");
                 }
             }
-        }else if(!strcmp(line,"/help")){
-            print_admin_help();
         }else if(!strcmp(line,"/quit")){
-            request_shutdown();
+            running = 0;
             break;
         }else if(line[0]){
-            fprintf(stderr,"[Serveur] Commande inconnue. Tape /help.\n");
+            fprintf(stderr,"[Serveur] Commandes: /banner <txt> | /banner_clr | /sys <txt> | /list | /quit\n");
         }
     }
     return NULL;
@@ -227,32 +195,26 @@ int main(int argc, char **argv){
     }
     if(load_server_conf(argv[1], &gconf)<0) die_perror("server conf");
 
-    /* handlers POSIX (sans SA_RESTART) */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_sigint;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    // handlers (signal simple)
+    signal(SIGINT,  on_sigint);
+    signal(SIGTERM, on_sigint);
+    signal(SIGCHLD, on_sigchld);
 
-    struct sigaction sc;
-    memset(&sc, 0, sizeof sc);
-    sc.sa_handler = on_sigchld;
-    sigemptyset(&sc.sa_mask);
-    sc.sa_flags = 0;
-    sigaction(SIGCHLD, &sc, NULL);
-
-    // state
     GMAX = gconf.max_groups;
     groups = (GroupRec*)calloc(GMAX, sizeof *groups);
     if(!groups){ perror("calloc groups"); return 1; }
 
-    // socket contrôle (UDP)
     sock_ctrl = socket(AF_INET, SOCK_DGRAM, 0);
     if(sock_ctrl<0) die_perror("socket");
 
-    int yes=1; setsockopt(sock_ctrl, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    int yes=1;
+    setsockopt(sock_ctrl, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+
+    // ✅ Fix Ctrl-C: timeout recvfrom => la boucle se réveille et lit running
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 300000; // 300ms
+    setsockopt(sock_ctrl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     struct sockaddr_in srv={0};
     srv.sin_family = AF_INET;
@@ -261,31 +223,31 @@ int main(int argc, char **argv){
     else if(inet_pton(AF_INET, gconf.bind_ip, &srv.sin_addr)!=1) die_perror("inet_pton bind");
     if(bind(sock_ctrl, (struct sockaddr*)&srv, sizeof srv)<0) die_perror("bind server");
 
+    pthread_create(&th_in, NULL, admin_input_thread, NULL);
+
     fprintf(stderr,"[Serveur] écoute UDP %s:%u  | groupes %u..%u  | idle=%us\n",
             gconf.bind_ip, (unsigned)gconf.server_port,
             (unsigned)gconf.base_port, (unsigned)(gconf.base_port+GMAX-1),
             gconf.idle_timeout);
 
-    print_admin_help();
-
-    if(pthread_create(&th_in, NULL, admin_input_thread, NULL) == 0){
-        th_in_started = 1;
-    }
-
     char buf[1024];
     while(running){
         struct sockaddr_in cli; socklen_t cl=sizeof cli;
-
         ssize_t n = recvfrom(sock_ctrl, buf, sizeof buf -1, 0, (struct sockaddr*)&cli, &cl);
         if(n<0){
-            if(errno==EINTR) continue;
-            if(!running) break;
-            if(errno == EBADF || errno == ENOTSOCK) break;
+            if(errno==EINTR){
+                if(!running) break;
+                continue;
+            }
+            if(errno==EAGAIN || errno==EWOULDBLOCK){
+                // timeout -> re-check running
+                continue;
+            }
             die_perror("recvfrom");
         }
         buf[n]='\0';
 
-        /* LIST */
+        // LIST
         if(!strncmp(buf,"LIST",4)){
             char out[4096]; out[0]='\0';
             for(unsigned i=0;i<GMAX;i++){
@@ -296,31 +258,25 @@ int main(int argc, char **argv){
                 }
             }
             if(out[0]=='\0') strcpy(out,"(aucun)\n");
-            if(sock_ctrl >= 0) sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
+            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
             continue;
         }
 
-        /* CREATE <group> [user] */
+        // CREATE <name> [user]
         if(!strncmp(buf,"CREATE ",7)){
             char gname[NAME_LEN]={0};
             char user[EME_LEN]={0};
-
-            // accepte "CREATE G" ou "CREATE G user"
             int nb = sscanf(buf+7,"%31s %19s", gname, user);
             if(nb < 1) continue;
 
             int idx = find_group_by_name(gname);
             if(idx>=0){
-                // si déjà existant: on répond OK avec port (et token si owner correspond)
-                if(nb==2 && groups[idx].owner[0] && !strcmp(groups[idx].owner, user) && groups[idx].token[0]){
-                    char out[256];
-                    snprintf(out,sizeof out,"OK %s %u %s", groups[idx].name, (unsigned)groups[idx].port, groups[idx].token);
-                    sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
-                }else{
-                    char out[128];
+                char out[256];
+                if(groups[idx].admin_token[0])
+                    snprintf(out,sizeof out,"OK %s %u %s", groups[idx].name, (unsigned)groups[idx].port, groups[idx].admin_token);
+                else
                     snprintf(out,sizeof out,"OK %s %u", groups[idx].name, (unsigned)groups[idx].port);
-                    sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
-                }
+                sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
 
@@ -344,24 +300,16 @@ int main(int argc, char **argv){
             groups[freei].port = port;
             strncpy(groups[freei].name, gname, NAME_LEN-1);
 
-            // owner/token
-            groups[freei].owner[0] = '\0';
-            groups[freei].token[0] = '\0';
-            if(nb==2 && user[0]){
-                strncpy(groups[freei].owner, user, EME_LEN-1);
-                gen_token(groups[freei].token);
-            }
-
-            // addr admin -> 127.0.0.1:port
             memset(&groups[freei].addr,0,sizeof groups[freei].addr);
             groups[freei].addr.sin_family = AF_INET;
             groups[freei].addr.sin_port   = htons(port);
             inet_pton(AF_INET, "127.0.0.1", &groups[freei].addr.sin_addr);
 
-            // Réponse
-            if(nb==2 && groups[freei].token[0]){
+            groups[freei].admin_token[0] = '\0';
+            if(nb >= 2){
+                gen_token(groups[freei].admin_token);
                 char out[256];
-                snprintf(out,sizeof out,"OK %s %u %s", gname, (unsigned)port, groups[freei].token);
+                snprintf(out,sizeof out,"OK %s %u %s", gname, (unsigned)port, groups[freei].admin_token);
                 sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
             }else{
                 char out[128];
@@ -371,7 +319,7 @@ int main(int argc, char **argv){
             continue;
         }
 
-        /* JOIN <group> <user> <cip> <cport> */
+        // JOIN <name> <user> <cip> <cport>
         if(!strncmp(buf,"JOIN ",5)){
             char gname[NAME_LEN]={0}, user[EME_LEN]={0}, cip[64]={0};
             unsigned cport=0;
@@ -389,49 +337,66 @@ int main(int argc, char **argv){
             continue;
         }
 
-        /* MERGE <user> <tokenA> <groupA> <tokenB> <groupB> */
+        // MERGE <user> <tokenA> <groupA> <tokenB> <groupB>
         if(!strncmp(buf,"MERGE ",6)){
             char user[EME_LEN]={0};
-            char tokenA[ADMIN_TOKEN_LEN]={0}, tokenB[ADMIN_TOKEN_LEN]={0};
-            char groupA[NAME_LEN]={0}, groupB[NAME_LEN]={0};
+            char tokA[ADMIN_TOKEN_LEN]={0}, tokB[ADMIN_TOKEN_LEN]={0};
+            char gA[NAME_LEN]={0}, gB[NAME_LEN]={0};
 
-            if(sscanf(buf+6, "%19s %63s %31s %63s %31s", user, tokenA, groupA, tokenB, groupB) != 5){
-                const char *err="ERR bad_args";
+            if(sscanf(buf+6, "%19s %63s %31s %63s %31s", user, tokA, gA, tokB, gB) != 5){
+                const char *err="ERR merge_syntax";
                 sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
 
-            int idxA = find_group_by_name(groupA);
-            int idxB = find_group_by_name(groupB);
-            if(idxA<0 || idxB<0){
+            int iA = find_group_by_name(gA);
+            int iB = find_group_by_name(gB);
+            if(iA<0 || iB<0){
                 const char *err="ERR notfound";
                 sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
 
-            if(!is_owner_token_ok(idxA, user, tokenA) || !is_owner_token_ok(idxB, user, tokenB)){
-                const char *err="ERR not_owner";
+            if(!groups[iA].admin_token[0] || !groups[iB].admin_token[0]){
+                const char *err="ERR no_token";
                 sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
                 continue;
             }
 
-            // Ordonner à B de rediriger vers A
-            char ctrl[256];
-            snprintf(ctrl, sizeof ctrl, "CTRL REDIRECT %s %u merged_into_%s",
-                     groups[idxA].name, (unsigned)groups[idxA].port, groups[idxA].name);
-            sendto(sock_ctrl, ctrl, strlen(ctrl), 0,
-                   (struct sockaddr*)&groups[idxB].addr, sizeof groups[idxB].addr);
+            if(strcmp(groups[iA].admin_token, tokA)!=0 || strcmp(groups[iB].admin_token, tokB)!=0){
+                const char *err="ERR bad_token";
+                sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+                continue;
+            }
 
-            const char *ok="OK merged";
-            sendto(sock_ctrl,ok,strlen(ok),0,(struct sockaddr*)&cli,cl);
+            char ctrl[512];
+            snprintf(ctrl, sizeof ctrl, "CTRL REDIRECT %s %u merge", groups[iA].name, (unsigned)groups[iA].port);
+            sendto(sock_ctrl, ctrl, strlen(ctrl), 0, (struct sockaddr*)&groups[iB].addr, sizeof groups[iB].addr);
+
+            char sysmsg[512];
+            snprintf(sysmsg, sizeof sysmsg, "SYS [Fusion] %s a fusionne %s -> %s", user, groups[iB].name, groups[iA].name);
+            broadcast_to_groups(sysmsg);
+
+            char out[256];
+            snprintf(out, sizeof out, "OK MERGE %s %s", groups[iA].name, groups[iB].name);
+            sendto(sock_ctrl,out,strlen(out),0,(struct sockaddr*)&cli,cl);
             continue;
         }
 
-        // inconnu -> ignore
+        // unknown
+        {
+            const char *err="ERR unknown_cmd";
+            sendto(sock_ctrl,err,strlen(err),0,(struct sockaddr*)&cli,cl);
+        }
     }
 
-    // arrêt : tuer les groupes encore vivants
     fprintf(stderr,"[Serveur] arrêt…\n");
+
+    // Stop admin input thread cleanly
+    pthread_cancel(th_in);
+    pthread_join(th_in, NULL);
+
+    // Kill groups
     for(unsigned i=0;i<GMAX;i++){
         if(groups[i].used){
             kill(groups[i].pid, SIGINT);
@@ -443,11 +408,7 @@ int main(int argc, char **argv){
         }
     }
 
-    if(th_in_started){
-        pthread_join(th_in, NULL);
-    }
-    if(sock_ctrl >= 0) close(sock_ctrl);
-
+    if(sock_ctrl>=0) close(sock_ctrl);
     free(groups);
     return 0;
 }
