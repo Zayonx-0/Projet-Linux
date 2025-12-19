@@ -84,18 +84,20 @@ Le tout s’appuie sur **Commun.h** (constantes, tailles, utilitaires communs).
 ### Build
 ```bash
 make
-Clean
-bash
-Copier le code
+```
+
+### Nettoyage
+```bash
 make clean
+```
 Le Makefile détecte macOS vs Linux/WSL et ajuste les flags/Libs.
 
-Configuration
-conf/server.conf
-Exemple :
+---
 
-ini
-Copier le code
+## Configuration
+
+### conf/server.conf
+```ini
 SERVER_IP=0.0.0.0
 SERVER_PORT=8000
 BASE_PORT=8010
@@ -103,191 +105,132 @@ MAX_GROUPS=32
 
 # Timeout d'inactivité (en secondes) injecté dans GroupeISY
 IDLE_TIMEOUT_SEC=1800
-conf/client.conf
-Exemple :
+```
 
-ini
-Copier le code
+### conf/client.conf
+```ini
 USER=Matyas
 SERVER_IP=127.0.0.1
 SERVER_PORT=8000
 
 # Port local sur lequel le client reçoit les messages du groupe
 LOCAL_RECV_PORT=9001
-Lancement
-1) Démarrer le serveur
-bash
-Copier le code
+```
+
+---
+
+## Lancement
+
+1) **Démarrer le serveur**
+```bash
 ./ServeurISY conf/server.conf
-2) Lancer un client
-bash
-Copier le code
+```
+2) **Lancer un client**
+```bash
 ./ClientISY conf/client.conf
+```
 Le client ouvre automatiquement l’interface terminal (AffichageISY).
 Utilise un port LOCAL_RECV_PORT différent pour chaque client.
 
-Commandes client
-Menu principal
+---
+
+## Commandes client
+
+### Menu principal
 Dans l’UI, choisir :
+- **0** : Créer un groupe
+- **1** : Rejoindre un groupe
+- **2** : Lister les groupes
+- **3** : Dialoguer sur un groupe
+- **4** : Quitter
+- **5** : Quitter le groupe
 
-0 : Créer un groupe
-
-1 : Rejoindre un groupe
-
-2 : Lister les groupes
-
-3 : Dialoguer sur un groupe
-
-4 : Quitter
-
-5 : Quitter le groupe
-
-Mode dialogue
+### Mode dialogue
 Quand tu es dans un groupe et que tu dialogues :
-
-cmd : passer en mode commandes
-
-msg : revenir en mode message
-
-quit : revenir au menu principal
+- `cmd` : passer en mode commandes
+- `msg` : revenir en mode message
+- `quit` : revenir au menu principal
 
 Les messages entrants du groupe ne sont affichés que si tu es en mode “dialogue”.
 
-Mode cmd
-help : affiche l’aide
+### Mode cmd
+- `help` : affiche l’aide
+- `admin` : liste les tokens enregistrés
+- `settoken <groupe> <token>` : enregistrer un token manuellement
+- `ban <pseudo>` : bannir un membre du groupe courant
+- `unban <pseudo>` : débannir un membre du groupe courant
+- `merge <A> <B>` : fusionner B vers A (il faut être admin des deux)
 
-admin : liste les tokens enregistrés
+---
 
-settoken <groupe> <token> : enregistrer un token manuellement
-
-ban <pseudo> : bannir un membre du groupe courant
-
-unban <pseudo> : débannir un membre du groupe courant
-
-merge <A> <B> : fusionner B vers A (il faut être admin des deux)
-
-Commandes serveur
+## Commandes serveur
 Dans la console ServeurISY :
+- `/banner <texte>` : définit une bannière serveur (tous groupes)
+- `/banner_clr` : efface la bannière serveur
+- `/sys <texte>` : envoie un message SYS (tous groupes)
+- `/list` : liste les groupes actifs (port, pid, token)
+- `/quit` : stop serveur (Ctrl-C fonctionne aussi)
 
-/banner <texte> : définit une bannière serveur (tous groupes)
+---
 
-/banner_clr : efface la bannière serveur
-
-/sys <texte> : envoie un message SYS (tous groupes)
-
-/list : liste les groupes actifs (port, pid, token)
-
-/quit : stop serveur (Ctrl-C fonctionne aussi)
-
-Fusion de groupes
+## Fusion de groupes
 But : fusionner B → A (les clients de B basculent vers A).
 
-Étapes
-Créer deux groupes :
+### Étapes
+1. Créer deux groupes.
+2. Le créateur reçoit un token admin pour chaque groupe (stocké dans ClientISY).
+3. Dans un client (mode cmd) : `merge GRP_A GRP_B`
 
-Le créateur reçoit un token admin pour chaque groupe (stocké dans ClientISY).
+### Résultat
+- Serveur envoie CTRL REDIRECT au groupe B.
+- Groupe B broadcast CTRL REDIRECT ... à ses clients.
+- Les clients de B quittent B, changent de port vers A, et envoient (joined).
 
-Dans un client (mode cmd) :
+---
 
-merge GRP_A GRP_B
+## Modération ban-unban
 
-Résultat
-Serveur envoie CTRL REDIRECT au groupe B
+### Bannir
+Dans un groupe (mode cmd) : `ban Pseudo`
+- Le groupe enregistre le pseudo banni (persistant dans le process du groupe).
+- Supprime le membre des membres actifs.
+- Broadcast une ligne `[Action] (...) a banni (...)`.
 
-Groupe B broadcast CTRL REDIRECT ... à ses clients
+### Débannir
+Dans un groupe (mode cmd) : `unban Pseudo`
+- Retire le pseudo de la liste de bans.
+- Broadcast `[Action] ... a debanni ...`.
 
-Les clients de B :
+---
 
-quittent B
-
-changent de port vers A
-
-envoient (joined) pour récupérer bannières actives
-
-Modération ban-unban
-Bannir
-Dans un groupe (mode cmd) :
-
-text
-Copier le code
-ban Pseudo
-Effets :
-
-le groupe enregistre le pseudo banni (persistant dans le process du groupe)
-
-supprime le membre des membres actifs
-
-broadcast une ligne [Action] (...) a banni (...)
-
-Débannir
-text
-Copier le code
-unban Pseudo
-Effets :
-
-retire le pseudo de la liste de bans
-
-broadcast [Action] ... a debanni ...
-
-Inactivité et suppression
+## Inactivité et suppression
 Chaque GroupeISY surveille son activité :
+- Si l'inactivité dépasse un seuil (`IDLE_TIMEOUT_SEC`), affiche une bannière d’avertissement.
+- À l'expiration : broadcast un message SYS et le groupe se termine.
+- Côté client : détection automatique et conseil de taper `quit`.
 
-si inactivité dépasse un seuil (IDLE_TIMEOUT_SEC)
+---
 
-affiche une bannière d’avertissement avant suppression
+## Détails réseau
+Le projet utilise UDP (non fiable). Pour limiter les impacts :
+- `server_list_and_find()` tente plusieurs fois.
+- Distinction entre “pas de réponse” et “LIST reçu mais groupe absent”.
 
-à expiration :
+### Exécution sur Internet
+- Mettre `SERVER_IP=0.0.0.0` côté serveur.
+- Ouvrir les ports : `SERVER_PORT` et la plage `BASE_PORT` à `BASE_PORT + MAX_GROUPS`.
 
-broadcast un message SYS indiquant que le groupe est supprimé
+---
 
-le groupe se termine
+## Dépannage
+- **Messages reçus au menu** : Vérifier que `in_dialogue` est bien à 0 hors des groupes.
+- **Merge ne fait rien** : Vérifier les tokens via la commande `admin`.
+- **Ctrl-C ne fonctionne pas** : Normalement géré par `SO_RCVTIMEO` côté serveur.
 
-Côté client :
+---
 
-le client détecte le message de suppression
-
-conseille quit pour revenir au menu
-
-Détails réseau
-Le projet utilise UDP (non fiable : pertes possibles).
-
-Pour limiter les impacts :
-
-server_list_and_find() tente plusieurs fois
-
-on distingue “pas de réponse” (réseau) de “LIST reçu mais groupe absent” (groupe réellement supprimé)
-
-Exécution sur Internet
-Mettre SERVER_IP=0.0.0.0 côté serveur (bind)
-
-Ouvrir les ports nécessaires (firewall/NAT) :
-
-SERVER_PORT (ex: 8000)
-
-plage des ports groupes : BASE_PORT → BASE_PORT + MAX_GROUPS - 1
-
-Côté clients, SERVER_IP doit être l’IP publique ou DNS du serveur.
-
-Dépannage
-Je reçois des messages au menu
-Normalement non : le client n’affiche les messages entrants que si in_dialogue=1.
-Si ça arrive, vérifier que tu es sur la dernière version.
-
-Merge ne fait rien
-Vérifier les tokens (cmd → admin) pour A et B
-
-Vérifier que les groupes existent (2 → LIST)
-
-Vérifier la connectivité serveur
-
-Ctrl-C ne fonctionne pas
-Serveur : SO_RCVTIMEO réveille la boucle.
-
-Client : handler stoppe l’UI et envoie un (left) si possible.
-
-Structure du dépôt
-css
-Copier le code
+## Structure du dépôt
+```text
 .
 ├── src/
 │   ├── Commun.h
@@ -300,7 +243,10 @@ Copier le code
 │   └── client.conf
 ├── Makefile
 └── README.md
-Notes
-Les bans sont persistants dans la vie du process du groupe (si GroupeISY redémarre, la liste est perdue).
+```
 
-UDP n’assure pas la livraison : une version “production” utiliserait TCP ou un protocole fiable au-dessus d’UDP.
+---
+
+## Notes
+- Les bans sont persistants dans la vie du process du groupe uniquement.
+- UDP n'assure pas la livraison : ce projet est une base éducative.
