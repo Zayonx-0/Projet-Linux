@@ -17,13 +17,17 @@ Le tout s’appuie sur **Commun.h** (constantes, tailles, utilitaires communs).
 - [Configuration](#configuration)
 - [Lancement](#lancement)
 - [Commandes client](#commandes-client)
-- [Commandes serveur (admin console)](#commandes-serveur-admin-console)
+  - [Menu principal](#menu-principal)
+  - [Mode dialogue](#mode-dialogue)
+  - [Mode cmd](#mode-cmd)
+- [Commandes serveur](#commandes-serveur)
 - [Fusion de groupes](#fusion-de-groupes)
-- [Modération (ban/unban)](#modération-banunban)
-- [Inactivité et suppression de groupe](#inactivité-et-suppression-de-groupe)
-- [Détails réseau (UDP)](#détails-réseau-udp)
+- [Modération ban-unban](#modération-ban-unban)
+- [Inactivité et suppression](#inactivité-et-suppression)
+- [Détails réseau](#détails-réseau)
 - [Dépannage](#dépannage)
 - [Structure du dépôt](#structure-du-dépôt)
+- [Notes](#notes)
 
 ---
 
@@ -104,7 +108,7 @@ Exemple :
 
 ini
 Copier le code
-USER=franck
+USER=Matyas
 SERVER_IP=127.0.0.1
 SERVER_PORT=8000
 
@@ -138,7 +142,7 @@ Dans l’UI, choisir :
 
 5 : Quitter le groupe
 
-Mode “dialogue”
+Mode dialogue
 Quand tu es dans un groupe et que tu dialogues :
 
 cmd : passer en mode commandes
@@ -147,9 +151,9 @@ msg : revenir en mode message
 
 quit : revenir au menu principal
 
-Important : les messages entrants du groupe ne sont affichés que si tu es en mode “dialogue”.
+Les messages entrants du groupe ne sont affichés que si tu es en mode “dialogue”.
 
-Mode cmd (admin / gestion)
+Mode cmd
 help : affiche l’aide
 
 admin : liste les tokens enregistrés
@@ -162,7 +166,7 @@ unban <pseudo> : débannir un membre du groupe courant
 
 merge <A> <B> : fusionner B vers A (il faut être admin des deux)
 
-Commandes serveur (admin console)
+Commandes serveur
 Dans la console ServeurISY :
 
 /banner <texte> : définit une bannière serveur (tous groupes)
@@ -179,13 +183,11 @@ Fusion de groupes
 But : fusionner B → A (les clients de B basculent vers A).
 
 Étapes
-Créer deux groupes via le même client ou deux clients :
+Créer deux groupes :
 
 Le créateur reçoit un token admin pour chaque groupe (stocké dans ClientISY).
 
-Entrer en dialogue, puis :
-
-cmd
+Dans un client (mode cmd) :
 
 merge GRP_A GRP_B
 
@@ -202,8 +204,8 @@ changent de port vers A
 
 envoient (joined) pour récupérer bannières actives
 
-Modération (ban/unban)
-Ban
+Modération ban-unban
+Bannir
 Dans un groupe (mode cmd) :
 
 text
@@ -215,9 +217,9 @@ le groupe enregistre le pseudo banni (persistant dans le process du groupe)
 
 supprime le membre des membres actifs
 
-broadcast une ligne [Action] (admin) a banni (...) ou avec le nom admin si fourni
+broadcast une ligne [Action] (...) a banni (...)
 
-Unban
+Débannir
 text
 Copier le code
 unban Pseudo
@@ -227,10 +229,10 @@ retire le pseudo de la liste de bans
 
 broadcast [Action] ... a debanni ...
 
-Inactivité et suppression de groupe
+Inactivité et suppression
 Chaque GroupeISY surveille son activité :
 
-si inactivité dépasse un seuil (ex: IDLE_TIMEOUT_SEC)
+si inactivité dépasse un seuil (IDLE_TIMEOUT_SEC)
 
 affiche une bannière d’avertissement avant suppression
 
@@ -246,10 +248,8 @@ le client détecte le message de suppression
 
 conseille quit pour revenir au menu
 
-au prochain passage menu, l’état peut être reset proprement
-
-Détails réseau (UDP)
-Le projet utilise UDP (non fiable par nature : pertes possibles).
+Détails réseau
+Le projet utilise UDP (non fiable : pertes possibles).
 
 Pour limiter les impacts :
 
@@ -269,27 +269,21 @@ plage des ports groupes : BASE_PORT → BASE_PORT + MAX_GROUPS - 1
 Côté clients, SERVER_IP doit être l’IP publique ou DNS du serveur.
 
 Dépannage
-“Je reçois les messages quand je suis au menu”
+Je reçois des messages au menu
 Normalement non : le client n’affiche les messages entrants que si in_dialogue=1.
-Si ça arrive, vérifier que tu es bien sur la dernière version des fichiers.
+Si ça arrive, vérifier que tu es sur la dernière version.
 
-“Merge ne fait rien”
-Vérifier que tu as bien des tokens admin pour A et B (cmd → admin)
+Merge ne fait rien
+Vérifier les tokens (cmd → admin) pour A et B
 
-Vérifier que le serveur est bien lancé et répond
+Vérifier que les groupes existent (2 → LIST)
 
-Vérifier que les deux groupes existent réellement (2 → LIST)
+Vérifier la connectivité serveur
 
-Vérifier que les ports groupe sont ouverts si exécution via Internet
+Ctrl-C ne fonctionne pas
+Serveur : SO_RCVTIMEO réveille la boucle.
 
-“Le client se fait éjecter du groupe en entrant en dialogue”
-Cause classique : LIST perdu (UDP). La logique actuelle évite le reset si LIST ne répond pas.
-Si tu es encore concerné, vérifier que server_list_and_find() retourne bien -1 sur absence de réponse et que le code ne fait pas de cleanup dans ce cas.
-
-“Ctrl-C ne fonctionne pas”
-Serveur : SO_RCVTIMEO est utilisé pour réveiller la boucle.
-
-Client : le handler stoppe l’UI et envoie un (left) si possible.
+Client : handler stoppe l’UI et envoie un (left) si possible.
 
 Structure du dépôt
 css
@@ -307,8 +301,6 @@ Copier le code
 ├── Makefile
 └── README.md
 Notes
-Ce projet est conçu pour un usage pédagogique.
-
 Les bans sont persistants dans la vie du process du groupe (si GroupeISY redémarre, la liste est perdue).
 
-Le transport UDP n’assure pas la livraison : une implémentation “production” utiliserait TCP ou un protocole fiable au-dessus d’UDP.
+UDP n’assure pas la livraison : une version “production” utiliserait TCP ou un protocole fiable au-dessus d’UDP.
