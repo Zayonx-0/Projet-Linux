@@ -29,27 +29,38 @@ typedef struct {
 static int load_server_conf(const char *path, ServerConf *c){
     memset(c,0,sizeof *c);
     strncpy(c->bind_ip, "0.0.0.0", sizeof c->bind_ip - 1);
-    c->server_port = 8000;
-    c->base_port   = 8010;
-    c->max_groups  = MAX_GROUPS_DEFAULT;
+    c->server_port  = 8000;
+    c->base_port    = 8010;
+    c->max_groups   = MAX_GROUPS_DEFAULT;
+
+    // valeur par défaut si absent du .conf
     c->idle_timeout = 1800;
 
     FILE *f=fopen(path,"r"); if(!f) return -1;
     char line[256], k[64], v[128];
     while(fgets(line,sizeof line,f)){
-        if(line[0]=='#' || strlen(line)<3) continue;
+        // enlever commentaire en fin de ligne (# ...)
+        char *hash = strchr(line, '#');
+        if(hash) *hash = '\0';
+
+        // skipper lignes vides
+        if(line[0]=='\0' || strlen(line)<3) continue;
+
         if(sscanf(line, "%63[^=]=%127s", k, v)==2){
-            if(!strcmp(k,"SERVER_IP"))      strncpy(c->bind_ip, v, sizeof c->bind_ip -1);
+            if(!strcmp(k,"SERVER_IP"))        strncpy(c->bind_ip, v, sizeof c->bind_ip -1);
             else if(!strcmp(k,"SERVER_PORT")) c->server_port = (uint16_t)atoi(v);
             else if(!strcmp(k,"BASE_PORT"))   c->base_port   = (uint16_t)atoi(v);
             else if(!strcmp(k,"MAX_GROUPS"))  c->max_groups  = (unsigned)atoi(v);
-            else if(!strcmp(k,"GROUP_IDLE_TIMEOUT_SEC")) c->idle_timeout = (unsigned)atoi(v);
+            else if(!strcmp(k,"IDLE_TIMEOUT_SEC"))
+                c->idle_timeout = (unsigned)atoi(v);
         }
     }
     fclose(f);
+
     if(c->max_groups==0 || c->max_groups>256) c->max_groups = MAX_GROUPS_DEFAULT;
     return 0;
 }
+
 
 /* ───────── Etat global ───────── */
 static volatile sig_atomic_t running = 1;

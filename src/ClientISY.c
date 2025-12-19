@@ -47,8 +47,11 @@ typedef struct {
     uint16_t redirect_port;
     char redirect_reason[128];
 
-    volatile int group_deleted; // group says it's deleted
+    volatile int group_deleted;
     volatile int stop_rx;
+
+    // n'afficher les messages RX que si on est dans "dialoguer"
+    volatile int in_dialogue;
 
     pthread_t rx_th;
     pthread_mutex_t mtx;
@@ -67,11 +70,8 @@ static void ui_send(ClientCtx *c, const char *fmt, ...){
     va_end(ap);
     size_t L = strlen(buf);
     if(L == 0) return;
-    if(buf[L-1] != '\n'){
-        dprintf(c->ui_in_fd, "%s\n", buf);
-    }else{
-        dprintf(c->ui_in_fd, "%s", buf);
-    }
+    if(buf[L-1] != '\n') dprintf(c->ui_in_fd, "%s\n", buf);
+    else dprintf(c->ui_in_fd, "%s", buf);
 }
 
 static void ui_set_header(ClientCtx *c){
@@ -102,9 +102,9 @@ static void ui_help(ClientCtx *c){
     ui_log(c, "  help                         -> affiche cette aide");
     ui_log(c, "  admin                        -> liste les tokens");
     ui_log(c, "  settoken <groupe> <token>     -> enregistre un token manuellement");
-    ui_log(c, "  ban <pseudo>                  -> bannit un membre (kick + interdit de revenir)");
+    ui_log(c, "  ban <pseudo>                  -> bannit un membre");
     ui_log(c, "  unban <pseudo>                -> retire le ban");
-    ui_log(c, "  merge <A> <B>                 -> fusionne B vers A (tokens admin des 2 groupes requis)");
+    ui_log(c, "  merge <A> <B>                 -> fusionne B vers A (tokens admin A et B requis)");
     ui_log(c, "  msg                          -> retour au mode messages");
     ui_log(c, "  quit                         -> retour au menu principal");
     ui_log(c, "====================================================");
@@ -187,9 +187,7 @@ static void token_set(ClientCtx *c, const char *group, const char *token){
             }
         }
     }
-    if(e){
-        isy_strcpy(e->token, sizeof e->token, token);
-    }
+    if(e) isy_strcpy(e->token, sizeof e->token, token);
     pthread_mutex_unlock(&c->mtx);
 }
 
@@ -245,30 +243,57 @@ static void cleanup_joined_state(ClientCtx *c){
 
 /* ───────────────────────── Server helpers ───────────────────────── */
 
+/*
+  Retour:
+    1  => groupe trouvé (out_port rempli)
+    0  => LIST reçu mais groupe absent
+   -1  => pas de réponse / erreur réseau (NE PAS reset l’état sur ce cas)
+*/
 static int server_list_and_find(ClientCtx *c, const char *gname, uint16_t *out_port){
     const char *cmd = "LIST";
-    if(sendto(c->sock_srv, cmd, strlen(cmd), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr) < 0)
-        return 0;
 
-    char buf[2048];
-    struct sockaddr_in from; socklen_t fl = sizeof from;
-    ssize_t n = recvfrom(c->sock_srv, buf, sizeof buf - 1, 0, (struct sockaddr*)&from, &fl);
-    if(n <= 0) return 0;
-    buf[n] = '\0';
-
-    char *save = NULL;
-    char *line = strtok_r(buf, "\n", &save);
-    while(line){
-        char name[32]; unsigned port;
-        if(sscanf(line, "%31s %u", name, &port) == 2){
-            if(!strcmp(name, gname)){
-                if(out_port) *out_port = (uint16_t)port;
-                return 1;
-            }
+    // retry UDP (pertes possibles)
+    for(int attempt=0; attempt<3; attempt++){
+        if(sendto(c->sock_srv, cmd, strlen(cmd), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr) < 0){
+            return -1;
         }
-        line = strtok_r(NULL, "\n", &save);
+
+        char buf[2048];
+        struct sockaddr_in from; socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(c->sock_srv, buf, sizeof buf - 1, 0, (struct sockaddr*)&from, &fl);
+        if(n <= 0){
+            if(errno == EAGAIN || errno == EWOULDBLOCK){
+                // retry
+                continue;
+            }
+            if(errno == EINTR){
+                // retry
+                continue;
+            }
+            return -1;
+        }
+
+        buf[n] = '\0';
+
+        char *save = NULL;
+        char *line = strtok_r(buf, "\n", &save);
+        while(line){
+            char name[32]; unsigned port;
+            if(sscanf(line, "%31s %u", name, &port) == 2){
+                if(!strcmp(name, gname)){
+                    if(out_port) *out_port = (uint16_t)port;
+                    return 1;
+                }
+            }
+            line = strtok_r(NULL, "\n", &save);
+        }
+
+        // LIST reçu mais pas trouvé
+        return 0;
     }
-    return 0;
+
+    // aucun LIST reçu après retries
+    return -1;
 }
 
 /* ───────────────────────── RX thread ───────────────────────── */
@@ -290,6 +315,7 @@ static void *rx_thread(void *arg){
         }
         buf[n] = '\0';
 
+        // CTRL: toujours traité
         if(!strncmp(buf, "CTRL ", 5)){
             if(!strncmp(buf, "CTRL BANNER_SET ", 16)){
                 ui_send(c, "UI BANNER_ADMIN_SET %s", buf + 16);
@@ -331,11 +357,15 @@ static void *rx_thread(void *arg){
                 isy_strcpy(c->redirect_reason, sizeof c->redirect_reason, reason[0]?reason:"redirect");
                 pthread_mutex_unlock(&c->mtx);
 
-                ui_log(c, "SYS: fusion/redirect demande par le serveur… bascule automatique.");
+                if(c->in_dialogue){
+                    ui_log(c, "SYS: redirect demande par le serveur… bascule automatique.");
+                }
                 continue;
             }
 
-            ui_log(c, "%s", buf);
+            if(c->in_dialogue){
+                ui_log(c, "%s", buf);
+            }
             continue;
         }
 
@@ -343,9 +373,16 @@ static void *rx_thread(void *arg){
             pthread_mutex_lock(&c->mtx);
             c->group_deleted = 1;
             pthread_mutex_unlock(&c->mtx);
+
+            if(c->in_dialogue){
+                ui_log(c, "%s", buf);
+            }
+            continue;
         }
 
-        ui_log(c, "%s", buf);
+        if(c->in_dialogue){
+            ui_log(c, "%s", buf);
+        }
     }
     return NULL;
 }
@@ -404,6 +441,7 @@ static void dialog_loop(ClientCtx *c){
     char line[512];
     int cmd_mode = 0;
 
+    c->in_dialogue = 1;
     ui_log(c, "Tapez quit pour revenir au menu, cmd pour entrer une commande, msg pour revenir aux messages.");
 
     while(1){
@@ -465,14 +503,8 @@ static void dialog_loop(ClientCtx *c){
         }
 
         if(cmd_mode){
-            if(!strcmp(line, "help")){
-                ui_help(c);
-                continue;
-            }
-            if(!strcmp(line, "admin")){
-                token_print(c);
-                continue;
-            }
+            if(!strcmp(line, "help")){ ui_help(c); continue; }
+            if(!strcmp(line, "admin")){ token_print(c); continue; }
             if(!strncmp(line, "settoken ", 9)){
                 char g[32]={0}, tok[ADMIN_TOKEN_LEN]={0};
                 if(sscanf(line+9, "%31s %63s", g, tok) == 2){
@@ -486,10 +518,7 @@ static void dialog_loop(ClientCtx *c){
             if(!strncmp(line, "ban ", 4)){
                 const char *victim = line + 4;
                 const char *tok = token_get(c, c->current_group);
-                if(!tok){
-                    ui_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
-                    continue;
-                }
+                if(!tok){ ui_log(c, "SYS: pas admin (token manquant)."); continue; }
                 char out2[256];
                 snprintf(out2, sizeof out2, "CMD BAN2 %s %s %s", tok, c->user, victim);
                 sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
@@ -499,51 +528,37 @@ static void dialog_loop(ClientCtx *c){
             if(!strncmp(line, "unban ", 6)){
                 const char *victim = line + 6;
                 const char *tok = token_get(c, c->current_group);
-                if(!tok){
-                    ui_log(c, "SYS: tu n'es pas admin de ce groupe (pas de token).");
-                    continue;
-                }
+                if(!tok){ ui_log(c, "SYS: pas admin (token manquant)."); continue; }
                 char out2[256];
                 snprintf(out2, sizeof out2, "CMD UNBAN2 %s %s %s", tok, c->user, victim);
                 sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
                 ui_log(c, "SYS: commande UNBAN envoyee.");
                 continue;
             }
-
             if(!strncmp(line, "merge ", 6)){
                 char A[32]={0}, B[32]={0};
                 if(sscanf(line+6, "%31s %31s", A, B) != 2){
                     ui_log(c, "SYS: syntaxe: merge <A> <B>");
                     continue;
                 }
-
                 const char *tA = token_get(c, A);
                 const char *tB = token_get(c, B);
                 if(!tA || !tB){
-                    ui_log(c, "SYS: il faut etre admin des 2 groupes (tokens manquants).");
+                    ui_log(c, "SYS: tokens manquants (il faut admin sur A et B).");
                     continue;
                 }
-
                 char req[256];
                 snprintf(req, sizeof req, "MERGE %s %s %s %s %s", c->user, tA, A, tB, B);
                 sendto(c->sock_srv, req, strlen(req), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr);
 
-                // IMPORTANT: ne jamais bloquer ici -> sock_srv a un timeout
                 char resp[256];
                 struct sockaddr_in from; socklen_t fl = sizeof from;
                 ssize_t n = recvfrom(c->sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
-
                 if(n > 0){
                     resp[n] = '\0';
                     ui_log(c, "%s", resp);
-                } else {
-                    if(errno == EAGAIN || errno == EWOULDBLOCK){
-                        ui_log(c, "SYS: merge envoye (pas de reponse immediate).");
-                    } else if(errno == EINTR){
-                        ui_log(c, "SYS: merge interrompu.");
-                    } else {
-                        ui_log(c, "SYS: merge envoye (recv err: %s)", strerror(errno));
-                    }
+                }else{
+                    ui_log(c, "SYS: merge envoye (pas de reponse immediate).");
                 }
                 continue;
             }
@@ -552,11 +567,12 @@ static void dialog_loop(ClientCtx *c){
             continue;
         }
 
-        // message mode
         char out[512];
         snprintf(out, sizeof out, "MSG %s %s", c->user, line);
         sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
     }
+
+    c->in_dialogue = 0;
 }
 
 /* ───────────────────────── Signals ───────────────────────── */
@@ -618,6 +634,7 @@ int main(int argc, char **argv){
 
     c.ui_in_fd = -1;
     c.ui_out_fd = -1;
+    c.in_dialogue = 0;
 
     isy_strcpy(c.user, sizeof c.user, conf.user);
 
@@ -625,12 +642,11 @@ int main(int argc, char **argv){
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    // sockets
     c.sock_srv = socket(AF_INET, SOCK_DGRAM, 0);
     if(c.sock_srv < 0) die_perror("socket srv");
 
-    // >>> FIX IMPORTANT: timeout sur sock_srv pour éviter le freeze (merge / list / etc.)
-    struct timeval tvs; tvs.tv_sec = 0; tvs.tv_usec = 300000; // 300ms
+    // timeout plus confortable (évite faux négatifs)
+    struct timeval tvs; tvs.tv_sec = 1; tvs.tv_usec = 0;
     setsockopt(c.sock_srv, SOL_SOCKET, SO_RCVTIMEO, &tvs, sizeof tvs);
 
     memset(&c.srv_addr, 0, sizeof c.srv_addr);
@@ -647,18 +663,15 @@ int main(int argc, char **argv){
     laddr.sin_addr.s_addr = htonl(INADDR_ANY);
     if(bind(c.sock_rx, (struct sockaddr*)&laddr, sizeof laddr) < 0) die_perror("bind rx");
 
-    // start UI process
     if(start_ui(&c) < 0){
         perror("start_ui");
         return 1;
     }
     ui_set_header(&c);
 
-    // start RX thread
     c.stop_rx = 0;
     if(pthread_create(&c.rx_th, NULL, rx_thread, &c) != 0) die_perror("pthread_create rx");
 
-    // main menu loop (reads from UI)
     char in[512];
 
     while(g_running){
@@ -682,8 +695,7 @@ int main(int argc, char **argv){
                     ln = strtok_r(NULL, "\n", &save);
                 }
             } else {
-                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "(pas de reponse)");
-                else ui_log(&c, "(recv err: %s)", strerror(errno));
+                ui_log(&c, "(pas de reponse LIST)");
             }
             continue;
         }
@@ -702,8 +714,7 @@ int main(int argc, char **argv){
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
             if(n <= 0){
-                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "ERR: pas de reponse");
-                else ui_log(&c, "ERR: %s", strerror(errno));
+                ui_log(&c, "ERR: pas de reponse");
                 continue;
             }
             resp[n]='\0';
@@ -716,7 +727,7 @@ int main(int argc, char **argv){
 
             if(nb == 3 && tok[0]){
                 token_set(&c, okg, tok);
-                ui_log(&c, "SYS: tu es ADMIN de %s. Token enregistre. (cmd -> admin)", okg);
+                ui_log(&c, "SYS: tu es ADMIN de %s. (cmd -> admin)", okg);
             } else {
                 ui_log(&c, "SYS: aucun token recu -> pas admin.");
             }
@@ -746,8 +757,7 @@ int main(int argc, char **argv){
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
             if(n <= 0){
-                if(errno == EAGAIN || errno == EWOULDBLOCK) ui_log(&c, "Join failed (pas de reponse)");
-                else ui_log(&c, "Join failed (%s)", strerror(errno));
+                ui_log(&c, "Join failed (pas de reponse)");
                 continue;
             }
             resp[n]='\0';
@@ -773,6 +783,7 @@ int main(int argc, char **argv){
             ui_set_header(&c);
 
             ui_log(&c, "Connexion au groupe %s realisee.", okg);
+
             group_send_join_hello(&c);
             continue;
         }
@@ -789,12 +800,20 @@ int main(int argc, char **argv){
             }
 
             uint16_t dummy_port;
-            if(!server_list_and_find(&c, cg, &dummy_port)){
+            int chk = server_list_and_find(&c, cg, &dummy_port);
+
+            if(chk == 0){
+                // LIST reçu, groupe absent => là oui on reset
                 ui_log(&c, "Le groupe n'existe plus (supprime). Etat reset.");
                 cleanup_joined_state(&c);
                 continue;
             }
+            if(chk < 0){
+                // pas de réponse LIST => NE PAS reset, on laisse tenter le dialogue
+                ui_log(&c, "SYS: serveur ne repond pas a LIST (UDP). On tente d'entrer en dialogue quand meme.");
+            }
 
+            ui_send(&c, "UI CLRLOG");
             dialog_loop(&c);
 
             pthread_mutex_lock(&c.mtx);
