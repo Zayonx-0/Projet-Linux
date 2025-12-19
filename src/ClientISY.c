@@ -5,18 +5,48 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>     // va_list / va_start / vsnprintf
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+    ─────────────────────────────────────────────────────────────────────────
+    ClientISY
+    ─────────────────────────────────────────────────────────────────────────
+    Rôle :
+      - Gère le réseau côté client :
+          * dialogue UDP avec ServeurISY (LIST / CREATE / JOIN / MERGE)
+          * dialogue UDP avec un GroupeISY (MSG / CMD BAN2 / CMD UNBAN2, bannières, redirect…)
+      - Ne gère pas l’affichage directement : l’UI est déportée dans AffichageISY.
+        ClientISY communique avec AffichageISY via deux FIFOs :
+          * fifo_in  : ClientISY -> AffichageISY (événements à afficher)
+          * fifo_out : AffichageISY -> ClientISY (entrées clavier utilisateur)
+
+    Points importants :
+      - UDP peut perdre des paquets : on évite de “reset” l’état client quand LIST ne répond pas.
+      - Les messages reçus du groupe ne doivent être affichés que dans le mode "dialogue".
+      - Les bannières sont envoyées au client via messages CTRL, puis AffichageISY les “pinnent” en haut.
+*/
+
 #define MAX_TOKENS 64
 
+/* Association (groupe -> token admin) stockée côté client */
 typedef struct {
     char group[32];
     char token[ADMIN_TOKEN_LEN];
     int  has;
 } TokenEntry;
 
+/*
+    Contexte du client :
+      - sockets UDP (serveur + groupe)
+      - état de session (joined, groupe courant)
+      - tokens admin
+      - gestion UI (fifos + pid du process AffichageISY)
+      - flags RX thread (redirect / deleted / stop)
+      - in_dialogue : autorise l’affichage des messages RX uniquement en dialogue
+*/
 typedef struct {
     // server control socket
     int sock_srv;
@@ -57,23 +87,38 @@ typedef struct {
     pthread_mutex_t mtx;
 } ClientCtx;
 
+/* Flag global pour arrêter proprement (signal handler) */
 static volatile sig_atomic_t g_running = 1;
 
 /* ───────────────────────── UI helpers (FIFO protocol) ───────────────────────── */
 
+/*
+    Envoie une commande UI à AffichageISY.
+    Toutes les commandes UI sont des lignes de texte terminées par '\n'.
+*/
 static void ui_send(ClientCtx *c, const char *fmt, ...){
     if(c->ui_in_fd < 0) return;
+
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+
     size_t L = strlen(buf);
     if(L == 0) return;
+
+    // On force un '\n' final si absent.
     if(buf[L-1] != '\n') dprintf(c->ui_in_fd, "%s\n", buf);
     else dprintf(c->ui_in_fd, "%s", buf);
 }
 
+/*
+    Met à jour le header affiché par l’UI :
+      UI HEADER <joined> <user> <group|->
+
+    On copie d’abord sous mutex pour éviter lecture partielle des champs.
+*/
 static void ui_set_header(ClientCtx *c){
     pthread_mutex_lock(&c->mtx);
     int joined = c->joined;
@@ -82,18 +127,25 @@ static void ui_set_header(ClientCtx *c){
     if(c->joined) isy_strcpy(grp, sizeof grp, c->current_group);
     pthread_mutex_unlock(&c->mtx);
 
-    ui_send(c, "UI HEADER %d %s %s", joined, user, grp[0]?grp:"-");
+    ui_send(c, "UI HEADER %d %s %s", joined, user, grp[0] ? grp : "-");
 }
 
+/* Ajoute une ligne dans le log UI (UI LOG ...) */
 static void ui_log(ClientCtx *c, const char *fmt, ...){
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+
     ui_send(c, "UI LOG %s", buf);
 }
 
+/*
+    Affiche l’aide côté UI.
+    Important : ici l’aide s’affiche dans l’historique (pas en “printf” classique),
+    donc l’utilisateur la voit dans la fenêtre de dialogue.
+*/
 static void ui_help(ClientCtx *c){
     ui_log(c, "=== AIDE CLIENTISY (admin / fusion / moderation) ===");
     ui_log(c, "Devenir ADMIN : cree le groupe via option 0. Si le serveur renvoie un token, il est enregistre.");
@@ -110,6 +162,7 @@ static void ui_help(ClientCtx *c){
     ui_log(c, "====================================================");
 }
 
+/* Affiche le menu (côté UI) */
 static void ui_menu(ClientCtx *c){
     ui_log(c, "Choix des commandes :");
     ui_log(c, "0 Creation de groupe");
@@ -121,7 +174,11 @@ static void ui_menu(ClientCtx *c){
     ui_log(c, "Entrez votre choix :");
 }
 
-/* lecture ligne depuis AffichageISY -> ClientISY */
+/*
+    Lit une ligne depuis AffichageISY (via fifo_out).
+    - L’UI envoie une ligne à chaque entrée utilisateur (incluant quit/cmd/msg/etc.).
+    - On implémente un petit buffer interne + découpe sur '\n'.
+*/
 static int ui_readline(ClientCtx *c, char *out, size_t outsz){
     if(c->ui_out_fd < 0) return 0;
 
@@ -129,22 +186,30 @@ static int ui_readline(ClientCtx *c, char *out, size_t outsz){
     static size_t len = 0;
 
     for(;;){
+        // Cherche un '\n' déjà en buffer
         for(size_t i=0;i<len;i++){
             if(buf[i] == '\n'){
                 size_t L = (i < outsz-1) ? i : outsz-1;
                 memcpy(out, buf, L);
                 out[L] = '\0';
+
+                // Retire la ligne du buffer
                 memmove(buf, buf+i+1, len-(i+1));
                 len -= (i+1);
+
                 trimnl(out);
                 return 1;
             }
         }
 
+        // Sinon, on attend des données sur ui_out_fd
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(c->ui_out_fd, &rfds);
-        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 300000;
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 300000; // 300ms
 
         int r = select(c->ui_out_fd+1, &rfds, NULL, NULL, &tv);
         if(r < 0){
@@ -152,6 +217,7 @@ static int ui_readline(ClientCtx *c, char *out, size_t outsz){
             return 0;
         }
         if(r == 0){
+            // Timeout : on continue, sauf si arrêt global demandé
             if(!g_running) return 0;
             continue;
         }
@@ -160,6 +226,8 @@ static int ui_readline(ClientCtx *c, char *out, size_t outsz){
             ssize_t n = read(c->ui_out_fd, buf+len, sizeof(buf)-len);
             if(n <= 0) return 0;
             len += (size_t)n;
+
+            // Sécurité : si flux invalide et buffer saturé, on reset
             if(len >= sizeof(buf)) len = 0;
         }
     }
@@ -174,8 +242,13 @@ static TokenEntry* token_find(ClientCtx *c, const char *group){
     return NULL;
 }
 
+/*
+    Enregistre un token (groupe -> token).
+    Si le groupe n’existe pas encore dans le tableau, on prend un slot libre.
+*/
 static void token_set(ClientCtx *c, const char *group, const char *token){
     pthread_mutex_lock(&c->mtx);
+
     TokenEntry *e = token_find(c, group);
     if(!e){
         for(int i=0;i<MAX_TOKENS;i++){
@@ -188,6 +261,7 @@ static void token_set(ClientCtx *c, const char *group, const char *token){
         }
     }
     if(e) isy_strcpy(e->token, sizeof e->token, token);
+
     pthread_mutex_unlock(&c->mtx);
 }
 
@@ -196,37 +270,58 @@ static const char* token_get(ClientCtx *c, const char *group){
     return e ? e->token : NULL;
 }
 
+/* Affiche tous les tokens connus (dans l’UI) */
 static void token_print(ClientCtx *c){
     ui_log(c, "=== TOKENS ADMIN ENREGISTRES ===");
     int any = 0;
+
     for(int i=0;i<MAX_TOKENS;i++){
         if(c->tokens[i].has){
             ui_log(c, "  - %s : %s", c->tokens[i].group, c->tokens[i].token);
             any = 1;
         }
     }
+
     if(!any) ui_log(c, "  (aucun token)");
     ui_log(c, "===============================");
 }
 
 /* ───────────────────────── Group join/leave ───────────────────────── */
 
+/*
+    Envoie un "MSG <user> (joined)" au groupe.
+    Le groupe utilise ce message pour :
+      - enregistrer (user -> addr)
+      - renvoyer les bannières actives au nouvel arrivant
+*/
 static void group_send_join_hello(ClientCtx *c){
     char hello[128];
     pthread_mutex_lock(&c->mtx);
     snprintf(hello, sizeof hello, "MSG %s %s", c->user, "(joined)");
     pthread_mutex_unlock(&c->mtx);
-    (void)sendto(c->sock_rx, hello, strlen(hello), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+
+    (void)sendto(c->sock_rx, hello, strlen(hello), 0,
+                (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
 }
 
+/*
+    Envoie un "MSG <user> (left)" au groupe.
+    Permet d’annoncer et/ou retirer le membre côté GroupeISY.
+*/
 static void group_send_left(ClientCtx *c){
     char bye[128];
     pthread_mutex_lock(&c->mtx);
     snprintf(bye, sizeof bye, "MSG %s %s", c->user, "(left)");
     pthread_mutex_unlock(&c->mtx);
-    (void)sendto(c->sock_rx, bye, strlen(bye), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
+
+    (void)sendto(c->sock_rx, bye, strlen(bye), 0,
+                (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
 }
 
+/*
+    Reset l’état "dans un groupe" côté client + reset UI.
+    Important : on efface aussi les bannières dans l’UI.
+*/
 static void cleanup_joined_state(ClientCtx *c){
     pthread_mutex_lock(&c->mtx);
     c->joined = 0;
@@ -244,32 +339,34 @@ static void cleanup_joined_state(ClientCtx *c){
 /* ───────────────────────── Server helpers ───────────────────────── */
 
 /*
-  Retour:
-    1  => groupe trouvé (out_port rempli)
-    0  => LIST reçu mais groupe absent
-   -1  => pas de réponse / erreur réseau (NE PAS reset l’état sur ce cas)
+    LIST puis recherche d’un groupe.
+    Retour:
+      1  => groupe trouvé (out_port rempli)
+      0  => LIST reçu mais groupe absent
+     -1  => pas de réponse / erreur réseau (NE PAS reset l’état sur ce cas)
+
+    Ce design évite un bug classique :
+      - si UDP drop le LIST, le client croyait que le groupe n'existait plus et se “reset” tout seul.
 */
 static int server_list_and_find(ClientCtx *c, const char *gname, uint16_t *out_port){
     const char *cmd = "LIST";
 
-    // retry UDP (pertes possibles)
+    // retries UDP (pertes possibles)
     for(int attempt=0; attempt<3; attempt++){
-        if(sendto(c->sock_srv, cmd, strlen(cmd), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr) < 0){
+        if(sendto(c->sock_srv, cmd, strlen(cmd), 0,
+                  (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr) < 0){
             return -1;
         }
 
         char buf[2048];
         struct sockaddr_in from; socklen_t fl = sizeof from;
-        ssize_t n = recvfrom(c->sock_srv, buf, sizeof buf - 1, 0, (struct sockaddr*)&from, &fl);
+
+        ssize_t n = recvfrom(c->sock_srv, buf, sizeof buf - 1, 0,
+                             (struct sockaddr*)&from, &fl);
+
         if(n <= 0){
-            if(errno == EAGAIN || errno == EWOULDBLOCK){
-                // retry
-                continue;
-            }
-            if(errno == EINTR){
-                // retry
-                continue;
-            }
+            if(errno == EAGAIN || errno == EWOULDBLOCK) continue; // retry
+            if(errno == EINTR) continue;                           // retry
             return -1;
         }
 
@@ -298,24 +395,34 @@ static int server_list_and_find(ClientCtx *c, const char *gname, uint16_t *out_p
 
 /* ───────────────────────── RX thread ───────────────────────── */
 
+/*
+    Thread dédié à la réception UDP sur sock_rx (messages du groupe).
+    - Les CTRL sont traités même hors dialogue (bannières doivent être maintenues).
+    - Les autres messages (chat/logs) ne sont envoyés à l’UI que si in_dialogue==1,
+      afin de ne pas polluer l’affichage du menu.
+*/
 static void *rx_thread(void *arg){
     ClientCtx *c = (ClientCtx*)arg;
     char buf[TXT_LEN + 256];
 
+    // petit timeout pour ne pas bloquer indéfiniment
     struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 300000;
     setsockopt(c->sock_rx, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     while(!c->stop_rx){
         struct sockaddr_in from; socklen_t fl = sizeof from;
-        ssize_t n = recvfrom(c->sock_rx, buf, sizeof buf - 1, 0, (struct sockaddr*)&from, &fl);
+        ssize_t n = recvfrom(c->sock_rx, buf, sizeof buf - 1, 0,
+                             (struct sockaddr*)&from, &fl);
+
         if(n < 0){
             if(errno == EINTR) continue;
             if(errno == EAGAIN || errno == EWOULDBLOCK) continue;
             continue;
         }
+
         buf[n] = '\0';
 
-        // CTRL: toujours traité
+        /* ───────── CTRL (bannières / redirect / etc.) ───────── */
         if(!strncmp(buf, "CTRL ", 5)){
             if(!strncmp(buf, "CTRL BANNER_SET ", 16)){
                 ui_send(c, "UI BANNER_ADMIN_SET %s", buf + 16);
@@ -333,17 +440,20 @@ static void *rx_thread(void *arg){
                 ui_send(c, "UI BANNER_IDLE_CLR");
                 continue;
             }
+
+            // Demande de bascule vers un autre groupe (fusion)
             if(!strncmp(buf, "CTRL REDIRECT ", 14)){
                 char ng[32]={0}, reason[128]={0};
                 unsigned p = 0;
                 const char *payload = buf + 14;
 
+                // parse "newGroup newPort reason..."
                 char *tmp = strdup(payload);
                 if(tmp){
                     char *save=NULL;
                     char *t1=strtok_r(tmp, " ", &save);
                     char *t2=strtok_r(NULL," ", &save);
-                    char *t3=save;
+                    char *t3=save; // reste de la ligne
                     if(t1) isy_strcpy(ng, sizeof ng, t1);
                     if(t2) p=(unsigned)atoi(t2);
                     if(t3 && *t3) isy_strcpy(reason, sizeof reason, t3);
@@ -354,7 +464,8 @@ static void *rx_thread(void *arg){
                 c->redirect_pending = 1;
                 isy_strcpy(c->redirect_group, sizeof c->redirect_group, ng);
                 c->redirect_port = (uint16_t)p;
-                isy_strcpy(c->redirect_reason, sizeof c->redirect_reason, reason[0]?reason:"redirect");
+                isy_strcpy(c->redirect_reason, sizeof c->redirect_reason,
+                           reason[0] ? reason : "redirect");
                 pthread_mutex_unlock(&c->mtx);
 
                 if(c->in_dialogue){
@@ -363,13 +474,17 @@ static void *rx_thread(void *arg){
                 continue;
             }
 
+            // CTRL inconnu => log uniquement si en dialogue
             if(c->in_dialogue){
                 ui_log(c, "%s", buf);
             }
             continue;
         }
 
-        if(!strncmp(buf, "SYS Le groupe est supprime", 26) || strstr(buf, "Le groupe est supprime")){
+        /* ───────── suppression du groupe (inactivité) ───────── */
+        if(!strncmp(buf, "SYS Le groupe est supprime", 26) ||
+           strstr(buf, "Le groupe est supprime")){
+
             pthread_mutex_lock(&c->mtx);
             c->group_deleted = 1;
             pthread_mutex_unlock(&c->mtx);
@@ -380,6 +495,7 @@ static void *rx_thread(void *arg){
             continue;
         }
 
+        /* ───────── message normal ───────── */
         if(c->in_dialogue){
             ui_log(c, "%s", buf);
         }
@@ -389,6 +505,12 @@ static void *rx_thread(void *arg){
 
 /* ───────────────────────── UI process spawn ───────────────────────── */
 
+/*
+    Lance AffichageISY comme process séparé :
+      - crée deux FIFOs uniques basées sur PID
+      - fork + execl("./AffichageISY", ...)
+      - ouvre les FIFOs en O_RDWR pour éviter certains blocages d’ouverture
+*/
 static int start_ui(ClientCtx *c){
     snprintf(c->fifo_in,  sizeof c->fifo_in,  "/tmp/isy_ui_in_%d",  (int)getpid());
     snprintf(c->fifo_out, sizeof c->fifo_out, "/tmp/isy_ui_out_%d", (int)getpid());
@@ -409,6 +531,7 @@ static int start_ui(ClientCtx *c){
 
     c->ui_pid = p;
 
+    // O_RDWR : évite certains deadlocks FIFO (lecture/écriture)
     c->ui_in_fd = open(c->fifo_in, O_RDWR);
     if(c->ui_in_fd < 0) return -1;
 
@@ -421,6 +544,7 @@ static int start_ui(ClientCtx *c){
     return 0;
 }
 
+/* Arrêt UI : envoie UI QUIT puis ferme / supprime les FIFOs */
 static void stop_ui(ClientCtx *c){
     if(c->ui_in_fd >= 0){
         ui_send(c, "UI QUIT");
@@ -437,6 +561,13 @@ static void stop_ui(ClientCtx *c){
 
 /* ───────────────────────── Dialogue loop ───────────────────────── */
 
+/*
+    Boucle de dialogue :
+      - in_dialogue=1 => le thread RX affiche les messages entrants
+      - lecture utilisateur via UI (ui_readline)
+      - mode message / mode cmd (cmd_mode)
+      - gère le redirect (fusion) automatiquement
+*/
 static void dialog_loop(ClientCtx *c){
     char line[512];
     int cmd_mode = 0;
@@ -445,6 +576,7 @@ static void dialog_loop(ClientCtx *c){
     ui_log(c, "Tapez quit pour revenir au menu, cmd pour entrer une commande, msg pour revenir aux messages.");
 
     while(1){
+        // snapshot de l’état sous mutex
         pthread_mutex_lock(&c->mtx);
         int joined = c->joined;
         int deleted = c->group_deleted;
@@ -457,8 +589,16 @@ static void dialog_loop(ClientCtx *c){
             ui_log(c, "SYS: le groupe a ete supprime. Tapez quit pour revenir au menu.");
         }
 
+        /*
+            Redirect :
+              - quitter proprement l’ancien groupe
+              - changer grp_addr (nouveau port)
+              - set current_group
+              - envoyer (joined) pour recevoir bannières actives du nouveau groupe
+        */
         if(redir){
             char ng[32]; uint16_t np; char rs[128];
+
             pthread_mutex_lock(&c->mtx);
             isy_strcpy(ng, sizeof ng, c->redirect_group);
             np = c->redirect_port;
@@ -483,14 +623,17 @@ static void dialog_loop(ClientCtx *c){
             continue;
         }
 
+        // lecture utilisateur (depuis AffichageISY)
         if(!ui_readline(c, line, sizeof line)) break;
         trimnl(line);
         if(line[0] == '\0') continue;
 
+        // sortir du dialogue
         if(!strcmp(line, "quit")){
             break;
         }
 
+        // bascule mode cmd / msg
         if(!strcmp(line, "cmd")){
             cmd_mode = 1;
             ui_log(c, "SYS: mode cmd actif. Tape 'help' pour les commandes, ou 'msg' pour revenir.");
@@ -502,9 +645,12 @@ static void dialog_loop(ClientCtx *c){
             continue;
         }
 
+        /* ───────── mode commandes ───────── */
         if(cmd_mode){
             if(!strcmp(line, "help")){ ui_help(c); continue; }
             if(!strcmp(line, "admin")){ token_print(c); continue; }
+
+            // settoken <groupe> <token>
             if(!strncmp(line, "settoken ", 9)){
                 char g[32]={0}, tok[ADMIN_TOKEN_LEN]={0};
                 if(sscanf(line+9, "%31s %63s", g, tok) == 2){
@@ -515,26 +661,43 @@ static void dialog_loop(ClientCtx *c){
                 }
                 continue;
             }
+
+            // ban <pseudo> : envoie CMD BAN2 <token> <adminUser> <victim>
             if(!strncmp(line, "ban ", 4)){
                 const char *victim = line + 4;
                 const char *tok = token_get(c, c->current_group);
-                if(!tok){ ui_log(c, "SYS: pas admin (token manquant)."); continue; }
+                if(!tok){
+                    ui_log(c, "SYS: pas admin (token manquant).");
+                    continue;
+                }
                 char out2[256];
                 snprintf(out2, sizeof out2, "CMD BAN2 %s %s %s", tok, c->user, victim);
                 sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
                 ui_log(c, "SYS: commande BAN envoyee.");
                 continue;
             }
+
+            // unban <pseudo>
             if(!strncmp(line, "unban ", 6)){
                 const char *victim = line + 6;
                 const char *tok = token_get(c, c->current_group);
-                if(!tok){ ui_log(c, "SYS: pas admin (token manquant)."); continue; }
+                if(!tok){
+                    ui_log(c, "SYS: pas admin (token manquant).");
+                    continue;
+                }
                 char out2[256];
                 snprintf(out2, sizeof out2, "CMD UNBAN2 %s %s %s", tok, c->user, victim);
                 sendto(c->sock_rx, out2, strlen(out2), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
                 ui_log(c, "SYS: commande UNBAN envoyee.");
                 continue;
             }
+
+            /*
+                merge <A> <B> :
+                  - nécessite token admin sur A et sur B
+                  - envoie au serveur : MERGE <user> <tokenA> <A> <tokenB> <B>
+                  - le serveur demandera au groupe B de rediriger ses clients vers A
+            */
             if(!strncmp(line, "merge ", 6)){
                 char A[32]={0}, B[32]={0};
                 if(sscanf(line+6, "%31s %31s", A, B) != 2){
@@ -547,10 +710,12 @@ static void dialog_loop(ClientCtx *c){
                     ui_log(c, "SYS: tokens manquants (il faut admin sur A et B).");
                     continue;
                 }
+
                 char req[256];
                 snprintf(req, sizeof req, "MERGE %s %s %s %s %s", c->user, tA, A, tB, B);
                 sendto(c->sock_srv, req, strlen(req), 0, (struct sockaddr*)&c->srv_addr, sizeof c->srv_addr);
 
+                // réponse serveur (avec timeout configuré sur sock_srv)
                 char resp[256];
                 struct sockaddr_in from; socklen_t fl = sizeof from;
                 ssize_t n = recvfrom(c->sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
@@ -567,6 +732,7 @@ static void dialog_loop(ClientCtx *c){
             continue;
         }
 
+        /* ───────── mode messages ───────── */
         char out[512];
         snprintf(out, sizeof out, "MSG %s %s", c->user, line);
         sendto(c->sock_rx, out, strlen(out), 0, (struct sockaddr*)&c->grp_addr, sizeof c->grp_addr);
@@ -577,15 +743,21 @@ static void dialog_loop(ClientCtx *c){
 
 /* ───────────────────────── Signals ───────────────────────── */
 
+/*
+    On conserve un pointeur global vers le contexte pour envoyer (left) et fermer l’UI
+    en cas de Ctrl-C.
+*/
 static ClientCtx *g_ctx = NULL;
 
 static void on_sig(int s){
     (void)s;
     g_running = 0;
+
     if(g_ctx){
         pthread_mutex_lock(&g_ctx->mtx);
         int joined = g_ctx->joined;
         pthread_mutex_unlock(&g_ctx->mtx);
+
         if(joined) group_send_left(g_ctx);
         ui_send(g_ctx, "UI QUIT");
     }
@@ -599,6 +771,7 @@ int main(int argc, char **argv){
         return 1;
     }
 
+    /* structure de config client (fichier conf/client.conf) */
     typedef struct {
         char user[EME_LEN];
         char srv_ip[64];
@@ -606,6 +779,7 @@ int main(int argc, char **argv){
         uint16_t local_port;
     } ClientConf;
 
+    /* valeurs par défaut */
     ClientConf conf;
     memset(&conf, 0, sizeof conf);
     isy_strcpy(conf.user, sizeof conf.user, "user");
@@ -613,6 +787,7 @@ int main(int argc, char **argv){
     conf.srv_port = 8000;
     conf.local_port = 9001;
 
+    /* lecture du fichier de config */
     FILE *f = fopen(argv[1], "r");
     if(!f) die_perror("client conf");
 
@@ -628,6 +803,7 @@ int main(int argc, char **argv){
     }
     fclose(f);
 
+    /* init contexte */
     ClientCtx c;
     memset(&c, 0, sizeof c);
     pthread_mutex_init(&c.mtx, NULL);
@@ -638,47 +814,63 @@ int main(int argc, char **argv){
 
     isy_strcpy(c.user, sizeof c.user, conf.user);
 
+    /* signaux */
     g_ctx = &c;
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
+    /* socket serveur (UDP) */
     c.sock_srv = socket(AF_INET, SOCK_DGRAM, 0);
     if(c.sock_srv < 0) die_perror("socket srv");
 
-    // timeout plus confortable (évite faux négatifs)
+    /*
+        Timeout confortable :
+          - évite blocages lors d’un recvfrom (merge / list)
+          - l’app reste réactive et affiche “pas de réponse” si nécessaire
+    */
     struct timeval tvs; tvs.tv_sec = 1; tvs.tv_usec = 0;
     setsockopt(c.sock_srv, SOL_SOCKET, SO_RCVTIMEO, &tvs, sizeof tvs);
 
     memset(&c.srv_addr, 0, sizeof c.srv_addr);
     c.srv_addr.sin_family = AF_INET;
     c.srv_addr.sin_port   = htons(conf.srv_port);
-    if(inet_pton(AF_INET, conf.srv_ip, &c.srv_addr.sin_addr) != 1) die_perror("inet_pton SERVER_IP");
+    if(inet_pton(AF_INET, conf.srv_ip, &c.srv_addr.sin_addr) != 1)
+        die_perror("inet_pton SERVER_IP");
 
+    /* socket RX groupe (UDP) */
     c.sock_rx = socket(AF_INET, SOCK_DGRAM, 0);
     if(c.sock_rx < 0) die_perror("socket rx");
 
+    /* bind sur port local pour recevoir les messages du groupe */
     struct sockaddr_in laddr; memset(&laddr, 0, sizeof laddr);
     laddr.sin_family = AF_INET;
     laddr.sin_port   = htons(conf.local_port);
     laddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if(bind(c.sock_rx, (struct sockaddr*)&laddr, sizeof laddr) < 0) die_perror("bind rx");
+    if(bind(c.sock_rx, (struct sockaddr*)&laddr, sizeof laddr) < 0)
+        die_perror("bind rx");
 
+    /* lancement AffichageISY */
     if(start_ui(&c) < 0){
         perror("start_ui");
         return 1;
     }
     ui_set_header(&c);
 
+    /* thread RX */
     c.stop_rx = 0;
-    if(pthread_create(&c.rx_th, NULL, rx_thread, &c) != 0) die_perror("pthread_create rx");
+    if(pthread_create(&c.rx_th, NULL, rx_thread, &c) != 0)
+        die_perror("pthread_create rx");
 
+    /* boucle menu principal */
     char in[512];
 
     while(g_running){
         ui_menu(&c);
+
         if(!ui_readline(&c, in, sizeof in)) break;
         trimnl(in);
 
+        /* 2: lister les groupes */
         if(!strcmp(in, "2")){
             const char *cmd = "LIST";
             sendto(c.sock_srv, cmd, strlen(cmd), 0, (struct sockaddr*)&c.srv_addr, sizeof c.srv_addr);
@@ -686,6 +878,7 @@ int main(int argc, char **argv){
             char resp[4096];
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
+
             if(n > 0){
                 resp[n]='\0';
                 char *save=NULL;
@@ -700,8 +893,10 @@ int main(int argc, char **argv){
             continue;
         }
 
+        /* 0: création de groupe (permet d’obtenir un token admin) */
         if(!strcmp(in, "0")){
             ui_log(&c, "Saisire le nom du groupe :");
+
             if(!ui_readline(&c, in, sizeof in)) break;
             trimnl(in);
             if(!in[0]) continue;
@@ -713,12 +908,14 @@ int main(int argc, char **argv){
             char resp[256];
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
+
             if(n <= 0){
                 ui_log(&c, "ERR: pas de reponse");
                 continue;
             }
             resp[n]='\0';
 
+            // format attendu: OK <group> <port> [token]
             char okg[32]={0}, tok[ADMIN_TOKEN_LEN]={0};
             unsigned p=0;
             int nb = sscanf(resp, "OK %31s %u %63s", okg, &p, tok);
@@ -734,6 +931,7 @@ int main(int argc, char **argv){
             continue;
         }
 
+        /* 1: rejoindre un groupe */
         if(!strcmp(in, "1")){
             pthread_mutex_lock(&c.mtx);
             int already = c.joined;
@@ -756,18 +954,21 @@ int main(int argc, char **argv){
             char resp[256];
             struct sockaddr_in from; socklen_t fl = sizeof from;
             ssize_t n = recvfrom(c.sock_srv, resp, sizeof resp - 1, 0, (struct sockaddr*)&from, &fl);
+
             if(n <= 0){
                 ui_log(&c, "Join failed (pas de reponse)");
                 continue;
             }
             resp[n]='\0';
 
+            // format attendu: OK <group> <port>
             unsigned p=0; char okg[32]={0};
             if(sscanf(resp, "OK %31s %u", okg, &p) != 2){
                 ui_log(&c, "%s", resp);
                 continue;
             }
 
+            // On prépare l’adresse du groupe (IP serveur + port groupe)
             pthread_mutex_lock(&c.mtx);
             c.joined = 1;
             isy_strcpy(c.current_group, sizeof c.current_group, okg);
@@ -777,6 +978,7 @@ int main(int argc, char **argv){
             c.group_deleted = 0;
             pthread_mutex_unlock(&c.mtx);
 
+            // Reset UI propre pour nouveau groupe
             ui_send(&c, "UI CLRLOG");
             ui_send(&c, "UI BANNER_ADMIN_CLR");
             ui_send(&c, "UI BANNER_IDLE_CLR");
@@ -784,10 +986,12 @@ int main(int argc, char **argv){
 
             ui_log(&c, "Connexion au groupe %s realisee.", okg);
 
+            // Important : déclenche l’envoi des bannières actives par le groupe
             group_send_join_hello(&c);
             continue;
         }
 
+        /* 3: entrer en dialogue */
         if(!strcmp(in, "3")){
             pthread_mutex_lock(&c.mtx);
             int joined = c.joined;
@@ -799,23 +1003,27 @@ int main(int argc, char **argv){
                 continue;
             }
 
+            /*
+                Vérification optionnelle :
+                  - LIST reçu ET groupe absent => reset (cas suppression)
+                  - LIST non reçu => on ne reset pas (UDP peut drop)
+            */
             uint16_t dummy_port;
             int chk = server_list_and_find(&c, cg, &dummy_port);
 
             if(chk == 0){
-                // LIST reçu, groupe absent => là oui on reset
                 ui_log(&c, "Le groupe n'existe plus (supprime). Etat reset.");
                 cleanup_joined_state(&c);
                 continue;
             }
             if(chk < 0){
-                // pas de réponse LIST => NE PAS reset, on laisse tenter le dialogue
                 ui_log(&c, "SYS: serveur ne repond pas a LIST (UDP). On tente d'entrer en dialogue quand meme.");
             }
 
             ui_send(&c, "UI CLRLOG");
             dialog_loop(&c);
 
+            // Si le groupe a été supprimé pendant le dialogue : reset global
             pthread_mutex_lock(&c.mtx);
             int deleted = c.group_deleted;
             pthread_mutex_unlock(&c.mtx);
@@ -826,6 +1034,7 @@ int main(int argc, char **argv){
             continue;
         }
 
+        /* 5: quitter le groupe courant */
         if(!strcmp(in, "5")){
             pthread_mutex_lock(&c.mtx);
             int joined = c.joined;
@@ -841,6 +1050,7 @@ int main(int argc, char **argv){
             continue;
         }
 
+        /* 4: quitter l’application */
         if(!strcmp(in, "4")){
             break;
         }
@@ -848,6 +1058,7 @@ int main(int argc, char **argv){
         ui_log(&c, "Commande inconnue.");
     }
 
+    /* cleanup final */
     pthread_mutex_lock(&c.mtx);
     int joined = c.joined;
     pthread_mutex_unlock(&c.mtx);
